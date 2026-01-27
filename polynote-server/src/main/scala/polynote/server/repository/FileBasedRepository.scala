@@ -1,31 +1,28 @@
 package polynote.server.repository
 
-import java.io.{FileNotFoundException, OutputStream}
-import java.net.URI
-import java.nio.channels.FileChannel
-import java.nio.file.{FileAlreadyExistsException, Path, Paths}
-import java.time.format.DateTimeFormatter
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import io.circe.ParsingFailure
 import polynote.kernel.NotebookRef.AlreadyClosed
-import polynote.kernel.{BaseEnv, GlobalEnv, NotebookRef, Result}
-import polynote.kernel.environment.Config
+import polynote.kernel.environment.{BroadcastAll, Config}
 import polynote.kernel.logging.Logging
-import polynote.kernel.util.{LongRef, ZTopic}
+import polynote.kernel.util.LongRef
+import polynote.kernel.{BaseEnv, GlobalEnv, NotebookRef, Result}
 import polynote.messages._
 import polynote.server.repository.format.NotebookFormat
+import polynote.server.repository.fs.WAL.WALWriter
 import polynote.server.repository.fs.{LocalFilesystem, NotebookFilesystem, WAL}
-import WAL.WALWriter
-import scodec.Codec
-import zio.{Fiber, IO, Promise, Queue, RIO, Ref, Schedule, Semaphore, Task, UIO, URIO, ZIO}
 import zio.ZIO.effectTotal
-import zio.blocking.effectBlocking
 import zio.clock.currentDateTime
 import zio.duration.Duration
 import zio.stream.{Take, ZStream}
-import zio.interop.catz._
+import zio.{Fiber, Hub, IO, Promise, Queue, RIO, Ref, Schedule, Semaphore, Task, UIO, URIO, ZHub, ZIO}
 
-
+import java.io.FileNotFoundException
+import java.net.URI
+import java.nio.file.{FileAlreadyExistsException, Path, Paths}
+import java.time.format.DateTimeFormatter
+import java.time.Instant
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class FileBasedRepository(
   val path: Path,
@@ -38,7 +35,7 @@ class FileBasedRepository(
   private final class FileNotebookRef private (
     current: Ref[(Int, Notebook)],
     pending: Queue[Take[Nothing, (NotebookUpdate, Option[Promise[Nothing, (Int, Notebook)]])]],
-    updatesTopic: ZTopic.Of[NotebookUpdate],
+    updatesTopic: Hub[NotebookUpdate],
     closed: Promise[Throwable, Unit],
     log: Logging.Service,
     renameLock: Semaphore,
@@ -136,7 +133,7 @@ class FileBasedRepository(
       closed.succeed(()) *>
         pending.offer(Take.end) *>
         pending.awaitShutdown *>
-        updatesTopic.close() *>
+        updatesTopic.shutdown *>
         process.await.flatMap(_.join) *>
         closed.await
 
@@ -166,7 +163,7 @@ class FileBasedRepository(
         }
     }
 
-    private def init(): RIO[BaseEnv with GlobalEnv, Unit] = {
+    private def init(): RIO[BaseEnv with GlobalEnv with BroadcastAll, Unit] = {
       def doUpdate(update: NotebookUpdate) = current.updateAndGet {
         case (prevVer, notebook) =>
           val nextVer = prevVer + 1
@@ -218,7 +215,8 @@ class FileBasedRepository(
         )
       }.forever.flip
 
-      val doSave = syncWAL &> save.whenM(saveNeeded)
+      val broadcastSaveMessage = get.map(_.path).flatMap(path => BroadcastAll(NotebookSaved(path, Instant.now().toEpochMilli)))
+      val doSave = syncWAL &> (save &> broadcastSaveMessage).whenM(saveNeeded)
 
       // every interval, check if the notebook needs to be written and do so
       val saveAtInterval =
@@ -233,7 +231,7 @@ class FileBasedRepository(
         .forkDaemon.flatMap(process.succeed).unit
     }
 
-    override def updates: ZStream[Any, Nothing, NotebookUpdate] = updatesTopic.subscribeStream
+    override def updates: ZStream[Any, Throwable, NotebookUpdate] = ZStream.fromHub(updatesTopic)
   }
 
   private object FileNotebookRef {
@@ -249,10 +247,10 @@ class FileBasedRepository(
         case false => ZIO.succeed(WALWriter.NoWAL)
       }
 
-    def apply(notebook: Notebook, version: Int): RIO[BaseEnv with GlobalEnv, FileNotebookRef] = for {
+    def apply(notebook: Notebook, version: Int): RIO[BaseEnv with GlobalEnv with BroadcastAll, FileNotebookRef] = for {
       log          <- Logging.access
       current      <- Ref.make(version -> notebook)
-      updatesTopic <- ZTopic.unbounded[NotebookUpdate]
+      updatesTopic <- ZHub.unbounded[NotebookUpdate]
       closed       <- Promise.make[Throwable, Unit]
       pending      <- Queue.unbounded[Take[Nothing, (NotebookUpdate, Option[Promise[Nothing, (Int, Notebook)]])]]
       renameLock   <- Semaphore.make(1L)
@@ -268,10 +266,13 @@ class FileBasedRepository(
     fmt            <- NotebookFormat.getFormat(pathOf(path))
     content        <- fs.readPathAsString(pathOf(path))
     (noExtPath, _)  = extractExtension(path)
-    nb             <- fmt.decodeNotebook(noExtPath, content)
+    nb             <- fmt.decodeNotebook(noExtPath, content).catchSome {
+      case err: io.circe.ParsingFailure =>
+        ZIO.fail(new ParsingFailure(s"Unable to parse file at $path: $err", err))
+    }
   } yield nb
 
-  override def openNotebook(path: String): RIO[BaseEnv with GlobalEnv, NotebookRef] = for {
+  override def openNotebook(path: String): RIO[BaseEnv with GlobalEnv with BroadcastAll, NotebookRef] = for {
     nb             <- loadNotebook(path)
     ref            <- FileNotebookRef(nb, 0)
   } yield ref
@@ -287,13 +288,17 @@ class FileBasedRepository(
     _         <- fs.writeStringToPath(pathOf(nb.path), rawString)
   } yield ()
 
-  override def listNotebooks(): RIO[BaseEnv with GlobalEnv, List[String]] = {
-    for {
+  override def listNotebooks(): RIO[BaseEnv with GlobalEnv, List[fsNotebook]] = {
+    val validFiles = for {
       files <- fs.list(path)
       isSupported <- NotebookFormat.isSupported
-    } yield files.filter(isSupported).map { relativePath =>
-      path.relativize(relativePath).toString
-    }
+    } yield files.filter(isSupported)
+
+    validFiles.flatMap(validFile => ZIO.foreach(validFile) { file => {
+      fs.lastModified(file).map { lastModifiedTime =>
+        fsNotebook(path.relativize(file).toString, lastModifiedTime)
+      }
+    }})
   }
 
   override def notebookExists(path: String): RIO[BaseEnv with GlobalEnv, Boolean] = fs.exists(pathOf(path))
@@ -359,7 +364,7 @@ class FileBasedRepository(
     } yield name
   }
 
-  override def createAndOpen(path: String, notebook: Notebook, version: Int): RIO[BaseEnv with GlobalEnv, NotebookRef] = for {
+  override def createAndOpen(path: String, notebook: Notebook, version: Int): RIO[BaseEnv with GlobalEnv with BroadcastAll, NotebookRef] = for {
     _   <- saveNotebook(notebook.copy(path = path))
     ref <- FileNotebookRef(notebook, version)
   } yield ref

@@ -3,16 +3,14 @@ package polynote.kernel
 import java.io.File
 import java.net.URL
 import java.util.concurrent.atomic.AtomicInteger
-import cats.syntax.traverse._
-import cats.instances.list._
 import polynote.kernel.environment.Config
 import polynote.kernel.util.{KernelReporter, LimitedSharingClassLoader, pathOf}
 import zio.blocking.Blocking
 import zio.system.{System, env}
 import zio.internal.{ExecutionMetrics, Executor}
 import zio.{Has, RIO, Task, UIO, ZIO}
-import zio.interop.catz._
 
+import scala.meta.internal.semanticdb.scalac.{SemanticdbOps, SemanticdbPlugin}
 import scala.collection.mutable
 import scala.reflect.internal.util.{AbstractFileClassLoader, NoSourceFile, Position, SourceFile}
 import scala.reflect.io.VirtualDirectory
@@ -21,6 +19,7 @@ import scala.tools.nsc.Settings
 import scala.tools.nsc.interactive.{Global, NscThief}
 import scala.reflect.internal.util.ScalaClassLoader.URLClassLoader
 import ScalaCompiler.OriginalPos
+import polynote.kernel.dependency.Artifact
 
 import scala.util.control.NonFatal
 
@@ -28,7 +27,7 @@ class ScalaCompiler private (
   val global: Global,
   val notebookPackage: String,
   val classLoader: AbstractFileClassLoader,
-  val dependencies: List[File],
+  val dependencies: List[Artifact],
   val otherClasspath: List[File]
 ) {
   import global._
@@ -53,6 +52,7 @@ class ScalaCompiler private (
       val resultType = formatTypeInternal(result)
       s"($paramStr) => $resultType"
     case ConstantType(Constant(v)) => v.toString
+    case RefinedType(parents, _) => parents.map(formatTypeInternal).mkString(" with ")
     case NoType => "<Unknown>"
     case typ if typ.typeSymbol.name == "TypedPythonObject" =>
       typ.typeArgs.headOption.fold("PythonObject")(name => formatTypeInternal(name) + " (Python)")
@@ -155,7 +155,7 @@ class ScalaCompiler private (
       ZIO.accessM[Class[_]](cls => ZIO(Option(cls.getDeclaredMethod(name).invoke(instance))) orElse ZIO.succeed(None))
 
     def getFields(names: List[String])(instance: AnyRef): RIO[Class[_], List[Option[AnyRef]]] =
-      names.map(getField(_)(instance)).sequence
+      ZIO.foreach(names)(getField(_)(instance))
 
     // first we'll try to get all of them at once.
     compileCell(CellCode(cellName, trees)).flatMap {
@@ -164,7 +164,7 @@ class ScalaCompiler private (
     }.catchAll {
       err =>
         // if that doesn't compile (i.e. some implicits are missing) we'll try to compile each individually
-        trees.zip(names).map {
+        ZIO.foreach(trees.zip(names)) {
           case (tree, name) =>
             compileCell(CellCode(cellName, List(tree))).flatMap {
               case Some(cls) => (construct >>= getField(name)).provide(cls)
@@ -172,9 +172,9 @@ class ScalaCompiler private (
             }.catchAllCause {
               cause =>
                 // TODO: log it?
-                ZIO.succeed(None)
+                ZIO.none
             }
-        }.sequence
+        }
     }
   }
 
@@ -581,7 +581,7 @@ object ScalaCompiler {
 
   def access: ZIO[Provider, Nothing, ScalaCompiler]    = ZIO.access[ScalaCompiler.Provider](_.get)
   def settings: ZIO[Provider, Nothing, Settings]       = access.map(_.global.settings)
-  def dependencies: ZIO[Provider, Nothing, List[File]] = access.map(_.dependencies)
+  def dependencies: ZIO[Provider, Nothing, List[Artifact]] = access.map(_.dependencies)
 
   private val _kernelCounter = new AtomicInteger(0)
   private[kernel] def kernelCounter: UIO[Int] = ZIO.effectTotal(_kernelCounter.getAndIncrement())
@@ -595,47 +595,48 @@ object ScalaCompiler {
 
 
   /**
-    * @param dependencyClasspath List of class path entries for direct dependencies. Classes from these entries will be
+    * @param dependencies     List of class path entries for direct dependencies. Classes from these entries will be
     *                            prioritized by auto-import/classpath-based completions in participating JVM languages.
-    * @param transitiveClasspath List of class path entries for transitive dependencies. These are still loaded in the
-    *                            notebook class loader, but they don't get higher priority for autocomplete.
-    * @param otherClasspath      List of class path entries which the compiler needs to know about, but which aren't
+    * @param otherClasspath   List of class path entries which the compiler needs to know about, but which aren't
     *                            going to be loaded by the dependency class loader (and thus will be loaded by the boot
     *                            class loader). This basically means Spark and its ilk.
-    * @param modifySettings      A function which will receive the base compiler [[Settings]], and can return modified
+    * @param modifySettings    A function which will receive the base compiler [[Settings]], and can return modified
     *                            settings which will be used to construct the compiler.
     * @return A [[ScalaCompiler]] instance
     */
   def apply(
-    dependencyClasspath: List[File],
-    transitiveClasspath: List[File],
+    dependencies: List[Artifact],
     otherClasspath: List[File],
     modifySettings: Settings => Settings
   ): RIO[Config with System, ScalaCompiler] = for {
-    settings          <- ZIO(modifySettings(defaultSettings(new Settings(), dependencyClasspath ++ transitiveClasspath ++ otherClasspath)))
-    global            <- ZIO(new Global(settings, KernelReporter(settings)))
-    counter           <- kernelCounter
-    notebookPackage    = s"notebook$counter"
-    classLoader       <- makeClassLoader(settings, dependencyClasspath ++ transitiveClasspath)
-  } yield new ScalaCompiler(global, notebookPackage, classLoader, dependencyClasspath, otherClasspath)
+    config             <- Config.access
+    dependencyClasspath = dependencies.map(_.file)
+    compilerClasspath   = if (config.behavior.dependencyIsolation) dependencyClasspath ++ otherClasspath else otherClasspath ++ dependencyClasspath
+    settings           <- ZIO(modifySettings(defaultSettings(new Settings(), compilerClasspath)))
+    global             <- ZIO(new Global(settings, KernelReporter(settings)))
+    counter            <- kernelCounter
+    notebookPackage     = s"notebook$counter"
+    classLoader        <- makeClassLoader(settings, dependencies)
+    _                  <- ZIO(new SemanticdbPlugin(global))
+  } yield new ScalaCompiler(global, notebookPackage, classLoader, dependencies, otherClasspath)
 
-  def apply(dependencyClasspath: List[File], transitiveClasspath: List[File], otherClasspath: List[File]): RIO[Config with System, ScalaCompiler] =
-    apply(dependencyClasspath, transitiveClasspath, otherClasspath, identity[Settings])
+  def apply(dependencies: List[Artifact], otherClasspath: List[File]): RIO[Config with System, ScalaCompiler] =
+    apply(dependencies, otherClasspath, identity[Settings] _)
 
-  def makeClassLoader(settings: Settings, dependencyClasspath: List[File]): RIO[Config, AbstractFileClassLoader] = for {
+  def makeClassLoader(settings: Settings, dependencyClasspath: List[Artifact]): RIO[Config, AbstractFileClassLoader] = for {
     dependencyClassLoader <- makeDependencyClassLoader(settings, dependencyClasspath)
     compilerOutput        <- ZIO.fromOption(settings.outputDirs.getSingleOutput).mapError(_ => new IllegalArgumentException("Compiler must have a single output directory"))
   } yield new AbstractFileClassLoader(compilerOutput, dependencyClassLoader)
 
-  def makeDependencyClassLoader(settings: Settings, dependencyClasspath: List[File]): RIO[Config, URLClassLoader] = Config.access.flatMap {
+  def makeDependencyClassLoader(settings: Settings, dependencyClasspath: List[Artifact]): RIO[Config, URLClassLoader] = Config.access.flatMap {
     config => ZIO {
       if (config.behavior.dependencyIsolation) {
         new LimitedSharingClassLoader(
           config.behavior.getSharedString,
-          dependencyClasspath.map(_.toURI.toURL),
+          dependencyClasspath.map(_.file.toURI.toURL),
           getClass.getClassLoader)
       } else {
-        new URLClassLoader(dependencyClasspath.map(_.toURI.toURL), getClass.getClassLoader)
+        new URLClassLoader(dependencyClasspath.map(_.file.toURI.toURL), getClass.getClassLoader)
       }
     }
   }

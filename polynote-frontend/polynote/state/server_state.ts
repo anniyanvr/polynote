@@ -12,7 +12,7 @@ import {
     StateView,
     updateProperty
 } from ".";
-import {Identity} from "../data/messages";
+import {Identity, NotebookSearchResult} from "../data/messages";
 import {SocketSession} from "../messaging/comms";
 import {NotebookMessageReceiver} from "../messaging/receiver";
 import {NotebookMessageDispatcher,} from "../messaging/dispatcher";
@@ -20,6 +20,8 @@ import {SparkPropertySet} from "../data/data";
 import {NotebookStateHandler} from "./notebook_state";
 import {SocketStateHandler} from "./socket_state";
 import {Updater} from "./state_handler";
+import {IPosition, IRange} from "monaco-editor";
+
 
 export type NotebookInfo = {
     handler: NotebookStateHandler,
@@ -30,19 +32,40 @@ export type NotebookInfo = {
     }
 };
 
+export type DependencySource = {
+    language: string,
+    content: string,
+    position: IPosition,
+    sourceNotebook: NotebookStateHandler
+}
+
+export interface OpenFile {
+    type: "notebook" | "dependency_source" | "page"
+    path: string
+}
+
+export function onlyNotebooks(ofs: OpenFile[]): string[] {
+    return ofs.filter(of => of.type === 'notebook').map(of => of.path)
+}
+
 export interface ServerState {
     // Keys are notebook path. Values denote whether the notebook has ever been loaded in this session.
     notebooks: Record<string, NotebookInfo["loaded"]>,
+    dependencySources: Record<string, DependencySource>,
+    notebookTimestamps: Record<string, number>,
     connectionStatus: "connected" | "disconnected",
     interpreters: Record<string, string>,
     serverVersion: string,
     serverCommit: string,
     identity: Identity,
-    sparkTemplates: SparkPropertySet[]
+    sparkTemplates: SparkPropertySet[],
+    notebookTemplates: string[],
+    notifications: boolean,
     // ephemeral states
     currentNotebook?: string,
-    openNotebooks: string[],
-    serverOpenNotebooks: string[]
+    openFiles: OpenFile[],
+    serverOpenNotebooks: string[],
+    searchResults: NotebookSearchResult[] // TODO: This should be an array of type SearchResult (which must be created)
 }
 
 export class ServerStateHandler extends BaseHandler<ServerState> {
@@ -57,15 +80,20 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
         if (!ServerStateHandler.inst) {
             ServerStateHandler.inst = new ServerStateHandler(new ObjectStateHandler<ServerState>({
                 notebooks: {},
+                dependencySources: {},
+                notebookTimestamps: {},
                 connectionStatus: "disconnected",
                 interpreters: {},
                 serverVersion: "unknown",
                 serverCommit: "unknown",
                 identity: new Identity("Unknown User", null),
                 sparkTemplates: [],
+                notebookTemplates: [],
+                notifications: false,
                 currentNotebook: undefined,
-                openNotebooks: [],
-                serverOpenNotebooks: []
+                openFiles: [],
+                serverOpenNotebooks: [],
+                searchResults: []
             }))
         }
         return ServerStateHandler.inst;
@@ -92,6 +120,10 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
         return ServerStateHandler.get.update(update, updateSource)
     }
 
+    static updateStateAsync(update: Updater<ServerState>, updateSource?: any) {
+        return ServerStateHandler.get.updateAsync(update, updateSource)
+    }
+
     // only for testing
     static clear() {
         if (ServerStateHandler.inst) {
@@ -99,15 +131,20 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
 
             ServerStateHandler.inst = new ServerStateHandler(new ObjectStateHandler<ServerState>({
                 notebooks: {},
+                dependencySources: {},
+                notebookTimestamps: {},
                 connectionStatus: "disconnected",
                 interpreters: {},
                 serverVersion: "unknown",
                 serverCommit: "unknown",
                 identity: new Identity("Unknown User", null),
                 sparkTemplates: [],
+                notebookTemplates: [],
+                notifications: false,
                 currentNotebook: undefined,
-                openNotebooks: [],
-                serverOpenNotebooks: []
+                openFiles: [],
+                serverOpenNotebooks: [],
+                searchResults: []
             }))
         }
     }
@@ -127,7 +164,7 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
 
         ServerStateHandler.updateState(state => ({
             notebooks: { [path]: nbInfo.loaded },
-            openNotebooks: open && !state.openNotebooks.includes(path) ? append(path) : NoUpdate
+            openFiles: open && (state.openFiles.findIndex(of => of.path === path) == -1) ? append({type: 'notebook', path: path }) : NoUpdate
         }))
 
         return new Promise(resolve => {
@@ -176,40 +213,63 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
             ServerStateHandler.notebooks[newPath] = nbInfo
             delete ServerStateHandler.notebooks[oldPath]
 
-            ServerStateHandler.updateState(state =>  {
-                const pathIdx = state.openNotebooks.indexOf(oldPath)
+            // perform state updates on server
+            ServerStateHandler.updateStateAsync(state =>  {
+                const pathIdx = state.openFiles.findIndex(of => of.type === 'notebook' && of.path === oldPath);
                 return {
                     notebooks: renameKey(oldPath, newPath),
-                    openNotebooks: pathIdx >= 0 ? replaceArrayValue(newPath, pathIdx) : NoUpdate
+                    openFiles: pathIdx >= 0 ? replaceArrayValue({type: 'notebook', path: newPath}, pathIdx) : NoUpdate,
+                    notebookTimestamps: renameKey(oldPath, newPath),
                 }
+            })
+                .then(() => {
+                    ServerStateHandler.selectFile(newPath); // now select the newly renamed notebook
             })
         }
     }
 
     static deleteNotebook(path: string) {
-        ServerStateHandler.closeNotebook(path, /*reinitialize*/ false).then(() => {
-            // update the server state's notebook dictionary
+        ServerStateHandler.closeFile(path, /*reinitialize*/ false).then(() => {
+            // update the server state's notebook dictionaries
             ServerStateHandler.get.updateField("notebooks", notebooks => notebooks[path] !== undefined ? removeKey(path) : NoUpdate);
+            ServerStateHandler.get.updateField("notebookTimestamps", notebooks => notebooks[path] !== undefined ? removeKey(path) : NoUpdate);
         })
     }
 
-    static closeNotebook(path: string, reinitialize: boolean = true): Promise<void> {
-        const maybeNb = ServerStateHandler.notebooks[path];
-        if (maybeNb) {
-            delete ServerStateHandler.notebooks[path];
+    static closeFile(path: string, reinitialize: boolean = true): Promise<void> {
+        const of = ServerStateHandler.state.openFiles.find(of => of.path === path);
+        if (of) {
+            if (of.type === 'notebook') {
+                const maybeNb = ServerStateHandler.notebooks[path];
+                if (maybeNb) {
+                    delete ServerStateHandler.notebooks[path];
 
-            return maybeNb.handler.dispose().then(() => {
-                ServerStateHandler.updateState(state => ({
-                    notebooks: updateProperty(path, false),
-                    openNotebooks: removeFromArray(state.openNotebooks, path)
-                }))
+                    return maybeNb.handler.dispose().then(() => {
+                        ServerStateHandler.updateState(state => {
+                            if (!of) return NoUpdate;
+                            return {
+                                notebooks: updateProperty(path, false),
+                                openFiles: removeFromArray(state.openFiles, of)
+                            }
+                        });
 
-                // reinitialize notebook
-                if (reinitialize) {
-                    this.getOrCreateNotebook(path)
-                }
-            })
-        } else return Promise.resolve()
+                        // reinitialize notebook
+                        if (reinitialize) {
+                            this.getOrCreateNotebook(path)
+                        }
+                    })
+                } else return Promise.resolve()
+            } else if (of.type === 'dependency_source') {
+                ServerStateHandler.updateState(state => {
+                    return {
+                        dependencySources: removeKey(of.path),
+                        openFiles: removeFromArray(state.openFiles, of)
+                    }
+                })
+                return Promise.resolve();
+            }
+        }
+        return Promise.resolve();
     }
 
     static reconnectNotebooks(onlyIfClosed: boolean) {
@@ -220,18 +280,19 @@ export class ServerStateHandler extends BaseHandler<ServerState> {
         })
     }
 
-    static get serverOpenNotebooks(): [string, NotebookInfo][] {
-        return ServerStateHandler.state.serverOpenNotebooks.reduce<[string, NotebookInfo][]>((acc, path) => {
+    static get serverOpenNotebooks(): [string, number, NotebookInfo][] {
+        return ServerStateHandler.state.serverOpenNotebooks.reduce<[string, number, NotebookInfo][]>((acc, path) => {
             const info = this.notebooks[path]
+            const lastSaved = ServerStateHandler.state.notebookTimestamps[path];
             if (info?.loaded) {
-                return [...acc, [path, info]]
+                return [...acc, [path, lastSaved, info]]
             } else if (info?.handler.state.kernel.status !== "disconnected") {
-                return [...acc, [path, info]]
+                return [...acc, [path, lastSaved, info]]
             } else return acc
         }, [])
     }
 
-    static selectNotebook(path: string) {
+    static selectFile(path: string) {
         ServerStateHandler.updateState(() => ({currentNotebook: path}))
     }
 

@@ -39,7 +39,9 @@ export abstract class ContentEdit extends CodecContainer {
                     return [[a], [new Insert(b.pos - a.length, b.content)]];
                 }
             } else { // (Delete, Delete)
-                if (a.pos + a.length <= b.pos) {
+                if (a.pos === b.pos && a.length === b.length) {
+                    return [[a], [a]]
+                } else if (a.pos + a.length <= b.pos) {
                     return [[a], [new Delete(b.pos - a.length, b.length)]];
                 } else if (b.pos + b.length <= a.pos) {
                     return [[new Delete(a.pos - b.length, a.length)], [b]];
@@ -81,7 +83,11 @@ export abstract class ContentEdit extends CodecContainer {
     }
 
     // port of ContentEdits#rebase, since there's no ContentEdits class here
-    static rebaseEdits(edits1: ContentEdit[], edits2: ContentEdit[]) {
+    static rebaseEdits(edits1: ContentEdit[], edits2: ContentEdit[]): ContentEdit[] {
+        return ContentEdit.rebaseBoth(edits1, edits2)[0];
+    }
+
+    static rebaseBoth(edits1: ContentEdit[], edits2: ContentEdit[]): [ContentEdit[], ContentEdit[]] {
         const result: ContentEdit[] = [];
         let otherEdits = edits2;
         edits1.forEach((edit) => {
@@ -89,7 +95,7 @@ export abstract class ContentEdit extends CodecContainer {
             result.push(...rebased[0]);
             otherEdits = rebased[1];
         });
-        return result;
+        return [result, otherEdits];
     }
 
     isEmpty() {

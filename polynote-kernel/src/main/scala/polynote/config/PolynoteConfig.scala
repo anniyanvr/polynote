@@ -5,15 +5,14 @@ import java.net.{InetSocketAddress, URI}
 import java.nio.file.Path
 import java.util.UUID
 import java.util.regex.Pattern
-
 import cats.syntax.either._
-import io.circe.generic.extras.semiauto._
+import io.circe.generic.extras.semiauto.{deriveConfiguredEncoder, deriveConfiguredDecoder}
 import io.circe.syntax._
 import io.circe._
 import polynote.kernel.{BaseEnv, TaskB}
 import polynote.kernel.environment.Config
 import polynote.kernel.logging.Logging
-import polynote.messages.ShortMap
+import polynote.messages.{ShortMap, ShortString, shortMapEncoder}
 import scodec.{Attempt, Codec}
 import scodec.codecs.implicits._
 import scodec.codecs.utf8_32
@@ -32,15 +31,15 @@ final case class Listen(
 }
 
 object Listen {
-  implicit val encoder: ObjectEncoder[Listen] = deriveEncoder
-  implicit val decoder: Decoder[Listen] = deriveConfigDecoder
+  implicit val encoder: Encoder.AsObject[Listen] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Listen] = deriveConfiguredDecoder
 }
 
 final case class Mount(dir: String, mounts: Map[String, Mount] = Map.empty)
 
 object Mount {
-  implicit val encoder: ObjectEncoder[Mount] = deriveEncoder
-  implicit val decoder: Decoder[Mount] = deriveConfigDecoder[Mount]
+  implicit val encoder: Encoder.AsObject[Mount] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Mount] = deriveConfiguredDecoder[Mount]
 }
 
 final case class KernelConfig(
@@ -62,8 +61,8 @@ object KernelConfig {
     portRange.start + ":" + portRange.end
   }
 
-  implicit val encoder: ObjectEncoder[KernelConfig] = deriveEncoder
-  implicit val decoder: Decoder[KernelConfig] = deriveConfigDecoder[KernelConfig]
+  implicit val encoder: Encoder.AsObject[KernelConfig] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[KernelConfig] = deriveConfiguredDecoder[KernelConfig]
 }
 
 final case class Wal(
@@ -71,8 +70,8 @@ final case class Wal(
 )
 
 object Wal {
-  implicit val encoder: ObjectEncoder[Wal] = deriveEncoder
-  implicit val decoder: Decoder[Wal] = deriveConfigDecoder[Wal]
+  implicit val encoder: Encoder.AsObject[Wal] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Wal] = deriveConfiguredDecoder[Wal]
 }
 
 final case class Storage(
@@ -83,8 +82,8 @@ final case class Storage(
 )
 
 object Storage {
-  implicit val encoder: ObjectEncoder[Storage] = deriveEncoder
-  implicit val decoder: Decoder[Storage] = deriveConfigDecoder[Storage]
+  implicit val encoder: Encoder.AsObject[Storage] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Storage] = deriveConfiguredDecoder[Storage]
 }
 
 sealed trait KernelIsolation
@@ -109,8 +108,9 @@ object KernelIsolation {
 
 final case class Behavior(
   dependencyIsolation: Boolean = true,
-  kernelIsolation: KernelIsolation = KernelIsolation.Always,  // TODO: Should move this to KernelConfig now?
-  sharedPackages: List[String] = Nil
+  kernelIsolation: KernelIsolation = KernelIsolation.Always, // TODO: Should move this to KernelConfig now?
+  sharedPackages: List[String] = Nil,
+  notebookTemplates: List[ShortString] = Nil
 ) {
   private final val defaultShares = "scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j"
 
@@ -118,15 +118,15 @@ final case class Behavior(
 }
 
 object Behavior {
-  implicit val encoder: ObjectEncoder[Behavior] = deriveEncoder
-  implicit val decoder: Decoder[Behavior] = deriveConfigDecoder
+  implicit val encoder: Encoder.AsObject[Behavior] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Behavior] = deriveConfiguredDecoder
 }
 
 final case class AuthProvider(provider: String, config: JsonObject)
 
 object AuthProvider {
-  implicit val encoder: ObjectEncoder[AuthProvider] = deriveEncoder
-  implicit val decoder: Decoder[AuthProvider] = deriveConfigDecoder
+  implicit val encoder: Encoder.AsObject[AuthProvider] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[AuthProvider] = deriveConfiguredDecoder
 }
 
 final case class Security(
@@ -135,8 +135,8 @@ final case class Security(
 )
 
 object Security {
-  implicit val encoder: ObjectEncoder[Security] = deriveEncoder
-  implicit val decoder: Decoder[Security] = deriveConfigDecoder
+  implicit val encoder: Encoder.AsObject[Security] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Security] = deriveConfiguredDecoder
 }
 
 final case class UI(
@@ -144,8 +144,8 @@ final case class UI(
 )
 
 object UI {
-  implicit val encoder: ObjectEncoder[UI] = deriveEncoder
-  implicit val decoder: Decoder[UI] = deriveDecoder
+  implicit val encoder: Encoder.AsObject[UI] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[UI] = deriveConfiguredDecoder
 }
 
 case class Credentials(
@@ -154,24 +154,39 @@ case class Credentials(
 object Credentials {
   final case class Coursier(path: String)
   object Coursier {
-    implicit val encoder: ObjectEncoder[Coursier] = deriveEncoder
-    implicit val decoder: Decoder[Coursier] = deriveDecoder
+    implicit val encoder: Encoder.AsObject[Coursier] = deriveConfiguredEncoder
+    implicit val decoder: Decoder[Coursier] = deriveConfiguredDecoder
   }
 
-  implicit val encoder: ObjectEncoder[Credentials] = deriveEncoder
-  implicit val decoder: Decoder[Credentials] = deriveDecoder
+  implicit val encoder: Encoder.AsObject[Credentials] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Credentials] = deriveConfiguredDecoder
+}
+
+final case class ScalaVersionConfig(
+  versionNumber: String,
+  versionProperties: ShortMap[String, String] = ShortMap(Map.empty[String, String]),
+  sparkSubmitArgs: Option[String] = None,
+  sparkVersion: String = ScalaVersionConfig.DEFAULT_SPARK_VERSION
+)
+
+object ScalaVersionConfig {
+  val DEFAULT_SPARK_VERSION = "3.3"
+
+  implicit val encoder: Encoder.AsObject[ScalaVersionConfig] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[ScalaVersionConfig] = deriveConfiguredDecoder
 }
 
 final case class SparkPropertySet(
   name: String,
   properties: ShortMap[String, String] = ShortMap(Map.empty[String, String]),
   sparkSubmitArgs: Option[String] = None,
+  versionConfigs: Option[List[ScalaVersionConfig]] = None,
   distClasspathFilter: Option[Pattern] = None
 )
 
 object SparkPropertySet {
-  implicit val decoder: Decoder[SparkPropertySet] = deriveConfigDecoder
-  implicit val encoder: Encoder[SparkPropertySet] = deriveEncoder
+  implicit val decoder: Decoder[SparkPropertySet] = deriveConfiguredDecoder
+  implicit val encoder: Encoder[SparkPropertySet] = deriveConfiguredEncoder
   private implicit val patternCodec: Codec[Pattern] = utf8_32.exmap(str => Attempt.fromTry(Try(Pattern.compile(str))), pat => Attempt.fromTry(Try(pat.pattern())))
   implicit val codec: Codec[SparkPropertySet] = cachedImplicit[Codec[SparkPropertySet]]
 }
@@ -182,12 +197,12 @@ final case class PySparkConfig(
 )
 
 object PySparkConfig {
-  implicit val encoder: ObjectEncoder[PySparkConfig] = deriveEncoder
-  implicit val decoder: Decoder[PySparkConfig] = deriveDecoder
+  implicit val encoder: Encoder.AsObject[PySparkConfig] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[PySparkConfig] = deriveConfiguredDecoder
 }
 
 final case class SparkConfig(
-  properties: Map[String, String],
+  properties: Map[String, String] = Map.empty,
   sparkSubmitArgs: Option[String] = None,
   distClasspathFilter: Option[Pattern] = None,
   propertySets: Option[List[SparkPropertySet]] = None,
@@ -208,12 +223,12 @@ object SparkConfig {
   def toMap(config: SparkConfig): Map[String, String] = config.properties ++ config.sparkSubmitArgs.toList.map("sparkSubmitArgs" -> _).toMap
 
   private val legacyDecoder: Decoder[SparkConfig] = mapStringStringDecoder.map(fromMap)
-  private val newDecoder: Decoder[SparkConfig] = deriveConfigDecoder
+  private val newDecoder: Decoder[SparkConfig] = deriveConfiguredDecoder
   implicit val decoder: Decoder[SparkConfig] = Decoder.decodeJsonObject.flatMap {
     case obj if obj.contains("properties") || obj.contains("spark_submit_args") || obj.contains("dist_classpath_filter") || obj.contains("property_sets") => newDecoder
     case _ => legacyDecoder
   }
-  implicit val encoder: Encoder[SparkConfig] = deriveEncoder
+  implicit val encoder: Encoder[SparkConfig] = deriveConfiguredEncoder
 }
 
 final case class StaticConfig(
@@ -222,8 +237,17 @@ final case class StaticConfig(
 )
 
 object StaticConfig {
-  implicit val encoder: Encoder[StaticConfig] = deriveEncoder
-  implicit val decoder: Decoder[StaticConfig] = deriveDecoder
+  implicit val encoder: Encoder[StaticConfig] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[StaticConfig] = deriveConfiguredDecoder
+}
+
+final case class Log(
+  verbosity: String = "info"
+)
+
+object Log {
+  implicit val encoder: Encoder.AsObject[Log] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[Log] = deriveConfiguredDecoder
 }
 
 final case class PolynoteConfig(
@@ -233,19 +257,22 @@ final case class PolynoteConfig(
   repositories: List[RepositoryConfig] = Nil,
   exclusions: List[String] = Nil,
   dependencies: Map[String, List[String]] = Map.empty,
+  downloadSources: Boolean = false,
   spark: Option[SparkConfig] = None,
   behavior: Behavior = Behavior(),
   security: Security = Security(),
   ui: UI = UI(),
   credentials: Credentials = Credentials(),
+  notifications: String = "",
   env: Map[String, String] = Map.empty,
-  static: StaticConfig = StaticConfig()
+  static: StaticConfig = StaticConfig(),
+  log: Log = Log()
 )
 
 
 object PolynoteConfig {
-  implicit val encoder: ObjectEncoder[PolynoteConfig] = deriveEncoder
-  implicit val decoder: Decoder[PolynoteConfig] = deriveConfigDecoder[PolynoteConfig]
+  implicit val encoder: Encoder.AsObject[PolynoteConfig] = deriveConfiguredEncoder
+  implicit val decoder: Decoder[PolynoteConfig] = deriveConfiguredDecoder[PolynoteConfig]
 
   private val defaultConfig = "default.yml" // we expect this to be in the directory Polynote was launched from.
 
@@ -259,7 +286,7 @@ object PolynoteConfig {
     effectBlocking(file.exists()).flatMap {
       case true => effectBlocking(new FileReader(file)).bracketAuto {
         reader => ZIO.fromEither {
-          yaml.parser.parse(reader).flatMap {
+          yaml.Parser.default.parse(reader).flatMap {
             case json if json.isBoolean => Right(Json.fromJsonObject(JsonObject.empty))
             case json if json.isObject  => Right(json)
             case json => Left(DecodingFailure(s"Invalid configuration; expected properties but found $json", Nil))

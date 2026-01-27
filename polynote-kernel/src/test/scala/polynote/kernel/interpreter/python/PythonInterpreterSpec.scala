@@ -1,15 +1,16 @@
 package polynote.kernel.interpreter.python
 
-import jep.python.PyCallable
+import jep.{JepException, SharedInterpreter}
 import org.scalatest.{FreeSpec, Matchers}
 import polynote.kernel.interpreter.State
+import polynote.kernel.interpreter.scal.ScalaInterpreter
 import polynote.kernel.{CompileErrors, Completion, CompletionType, Output, ParameterHint, ParameterHints, ScalaCompiler, Signatures}
 import polynote.messages.TinyList
 import polynote.runtime.MIMERepr
 import polynote.runtime.python.{PythonFunction, PythonObject}
-import polynote.testing.InterpreterSpec
+import polynote.testing.{InterpreterSpec, MockTaskManager}
 import polynote.testing.kernel.MockEnv
-import zio.interop.catz._
+import zio.ZLayer
 
 class PythonInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
 
@@ -417,7 +418,7 @@ class PythonInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec 
 
     "completions" in {
       val completions = interpreter.completionsAt("dela", 4, State.id(1)).runIO()
-      completions shouldEqual List(Completion("delattr", Nil, TinyList(List(TinyList(List(("obj", ""), ("name", "str"))))), "", CompletionType.Method))
+      completions shouldEqual List(Completion("delattr", Nil, TinyList(List(TinyList(List(("obj", "Any"), ("name", "str"))))), "", CompletionType.Method))
       val keywordCompletion = interpreter.completionsAt("d={'foo': 'bar'}; d['']", 21, State.id(1)).runIO()
       keywordCompletion shouldEqual List(Completion("'foo", Nil, Nil, "", CompletionType.Unknown, None))
     }
@@ -786,6 +787,31 @@ class PythonInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec 
           datetime shouldEqual "<class 'datetime.datetime'>"
           sys shouldEqual "<module 'sys' (built-in)>"
           arrayList shouldEqual "class java.util.ArrayList"
+      }
+    }
+  }
+
+  "Polyglot interop" - {
+    "should work with a Scala List" in {
+      val scalaInterpreter = ScalaInterpreter().provideSomeLayer[Environment](ZLayer.succeed(compiler) ++ MockTaskManager.layer).runIO()
+      val pythonInterpreter = interpreter
+      // works with python!
+      assertPolyOutput(List(
+        pythonInterpreter -> "x = [1, 2, 3, 4]",
+        pythonInterpreter -> "print('The third element of x is', x[2])"
+      )) {
+        case (vars, output) =>
+          stdOut(output) shouldEqual "The third element of x is 3\n"
+      }
+      // Works with scala!
+      assertPolyOutput(List(
+        scalaInterpreter -> "val x = Seq(1, 2, 3, 4)",
+        pythonInterpreter -> "print('The third element of x is', x.apply(2))"
+      )) {
+        case (vars, output) =>
+          println(vars)
+          println(output)
+          stdOut(output) shouldEqual "The third element of x is 3\n"
       }
     }
   }

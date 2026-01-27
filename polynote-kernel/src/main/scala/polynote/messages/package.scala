@@ -31,6 +31,10 @@ package object messages {
     else
       str.asInstanceOf[ShortString]
 
+    def truncatePretty(str: String): ShortString = if (str.length > Short.MaxValue) {
+      (str.substring(0, Short.MaxValue - 2) + "…").asInstanceOf[ShortString]
+    } else str.asInstanceOf[ShortString]
+
     def unapply(str: ShortString): Option[String] = Option(str)
   }
 
@@ -57,6 +61,7 @@ package object messages {
     def of[A](elems: A*): ShortList[A] = apply(elems.toList)
     val Nil: ShortList[Nothing] = apply(List.empty)
     def empty[A]: ShortList[A] = ShortList(List.empty[A])
+    def unapply[A](list: ShortList[A]): Option[List[A]] = Option(list)
   }
 
   implicit def shortListCodec[A](implicit ca: Lazy[Codec[A]]): Codec[ShortList[A]] =

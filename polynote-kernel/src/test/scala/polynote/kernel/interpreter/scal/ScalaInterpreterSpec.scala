@@ -1,29 +1,20 @@
 package polynote.kernel.interpreter
 package scal
 
-import cats.data.StateT
-import cats.syntax.traverse._
 import cats.instances.list._
+import cats.syntax.traverse._
 import org.scalatest.{FreeSpec, Matchers}
-import polynote.kernel.{Completion, CompletionType, Output, Result, ResultValue, ScalaCompiler, TaskInfo}
-import polynote.testing.{InterpreterSpec, ValueMap, ZIOSpec}
+import polynote.kernel.{Completion, CompletionType, Output, ResultValue}
 import polynote.messages.CellID
-import zio.{RIO, ZIO, ZLayer}
-import zio.blocking.Blocking
-import zio.clock.Clock
-import zio.console.Console
-import zio.interop.catz._
-import zio.random.Random
-import zio.system.System
+import polynote.testing.{InterpreterSpec, MockTaskManager, ValueMap}
+import zio.{ZIO, ZLayer}
 
 import scala.collection.mutable.ListBuffer
-import scala.reflect.internal.util.AbstractFileClassLoader
-import scala.reflect.io.VirtualDirectory
-import scala.tools.nsc.Settings
 
 class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
 
-  val interpreter: ScalaInterpreter = ScalaInterpreter().provideSomeLayer[Environment](ZLayer.succeed(compiler)).runIO()
+  val interpreter: ScalaInterpreter =
+    ScalaInterpreter().provideSomeLayer[Environment](ZLayer.succeed(compiler) ++ MockTaskManager.layer).runIO()
   import interpreter.ScalaCellState
 
 

@@ -10,6 +10,7 @@ import {
     h2,
     h3,
     h4,
+    helpIconButton,
     icon,
     iconButton,
     para,
@@ -34,6 +35,7 @@ import {displayData, prettyDisplayData, prettyDisplayString} from "../../display
 import {DataReader} from "../../../data/codec";
 import {DataRepr, StreamingDataRepr} from "../../../data/value_repr";
 import {ValueInspector} from "../value_inspector";
+import {copyToClipboard} from "./cell";
 
 // TODO: this should probably handle collapse and expand of the pane, rather than the Kernel itself.
 export class KernelPane extends Disposable {
@@ -51,36 +53,41 @@ export class KernelPane extends Disposable {
         this.header = div(['ui-panel-header'], [this.statusEl]);
 
         const handleCurrentNotebook = (path?: string) => {
-            if (path && path !== "home") {
-                const nbInfo = ServerStateHandler.getOrCreateNotebook(path);
-                // the notebook should already be loaded
-                if (nbInfo?.info) {
-                    if (this.kernels[path] === undefined) {
-                        const kernel = new Kernel(
-                            serverMessageDispatcher,
-                            nbInfo.info.dispatcher,
-                            nbInfo.handler,
-                            'rightPane');
-                        kernel.onDispose.then(() => delete this.kernels[path])
-                        this.kernels[path] = kernel;
+            if (path) {
+                const of = ServerStateHandler.state.openFiles.find(of => of.path === path);
+                if (of && of.type === 'notebook') {
+                    const nbInfo = ServerStateHandler.getOrCreateNotebook(path);
+                    // the notebook should already be loaded
+                    if (nbInfo?.info) {
+                        if (this.kernels[path] === undefined) {
+                            const kernel = new Kernel(
+                                serverMessageDispatcher,
+                                nbInfo.info.dispatcher,
+                                nbInfo.handler,
+                                'rightPane');
+                            kernel.onDispose.then(() => delete this.kernels[path])
+                            this.kernels[path] = kernel;
+                        }
+                        const kernel = this.kernels[path];
+                        document.getElementsByClassName('split-view')[0]?.classList?.remove('no-kernel');
+                        this.el.replaceWith(kernel.el);
+                        this.el = kernel.el
+
+                        this.statusEl.replaceWith(kernel.statusEl);
+                        this.statusEl = kernel.statusEl;
+                    } else {
+                        console.warn("Requested notebook at path", path, "but it wasn't loaded. This is unexpected...")
                     }
-                    const kernel = this.kernels[path];
-                    this.el.replaceWith(kernel.el);
-                    this.el = kernel.el
-
-                    this.statusEl.replaceWith(kernel.statusEl);
-                    this.statusEl = kernel.statusEl;
                 } else {
-                    console.warn("Requested notebook at path", path, "but it wasn't loaded. This is unexpected...")
-                }
-            } else {
-                // no notebook selected
-                // TODO: keep task component around for errors?
-                this.el.replaceWith(placeholderEl);
-                this.el = placeholderEl
+                    // no notebook selected
+                    // TODO: keep task component around for errors?
+                    document.getElementsByClassName('split-view')[0]?.classList?.add('no-kernel');
+                    this.el.replaceWith(placeholderEl);
+                    this.el = placeholderEl
 
-                this.statusEl.replaceWith(placeholderStatus);
-                this.statusEl = placeholderStatus;
+                    this.statusEl.replaceWith(placeholderStatus);
+                    this.statusEl = placeholderStatus;
+                }
             }
         }
         handleCurrentNotebook(ServerStateHandler.state.currentNotebook)
@@ -113,7 +120,10 @@ export class Kernel extends Disposable {
         this.statusEl = h2(['kernel-status'], [
             this.status = span(['status'], ['●']),
             'Kernel',
-            span(['buttons'], [
+            span(['left-buttons'], [
+                helpIconButton([], "https://polynote.org/latest/docs/kernel-pane/"),
+            ]),
+            span(['right-buttons'], [
                 iconButton(['connect'], 'Connect to server', 'plug', 'Connect').click(evt => this.connect(evt)),
                 iconButton(['start'], 'Start kernel', 'power-off', 'Start').click(evt => this.startKernel(evt)),
                 iconButton(['kill'], 'Kill kernel', 'skull', 'Kill').click(evt => this.killKernel(evt))
@@ -299,16 +309,14 @@ class KernelTasksEl extends Disposable {
     }
 
     private addError(id: string, err: ServerErrorWithCause) {
-        const el = ErrorEl.fromServerError(err, undefined).el;
+        const errorEl = ErrorEl.fromServerError(err, undefined);
 
         const message = div(["message"], [
             para([], `${err.className}: ${err.message}`),
-            para([], el)
+            para([], errorEl.el)
         ]);
 
-        this.addTask(id, id, message, TaskStatus.Error, 0, undefined, () => {
-            this.removeError(id)
-        })
+        this.addTask(id, id, message, TaskStatus.Error, 0, undefined, () => {this.removeError(id)}, () => errorEl.copyFromServerError());
     }
 
     private removeError(id: string) {
@@ -319,18 +327,21 @@ class KernelTasksEl extends Disposable {
         }
     }
 
-    private addTask(id: string, label: string, detail: Content, status: number, progress: number, parent: string | undefined = undefined, remove: () => void = () => this.dispatcher.cancelTask(id)) {
+    private addTask(id: string, label: string, detail: Content, status: number, progress: number, parent: string | undefined = undefined, remove: () => void = () => this.cancelTaskWrapper(id), copy?: () => string) {
         // short-circuit if the task coming in is already completed.
         if (status === TaskStatus.Complete) {
             remove()
         } else {
             const taskEl: KernelTask = Object.assign(div(['task', (Object.keys(TaskStatus)[status] || 'unknown').toLowerCase()], [
-                icon(['close-button'], 'times', 'close icon').click(() => remove()),
+                icon(['close-button'], 'times', 'close icon').click(evt => {
+                    evt.stopPropagation();
+                    remove();
+                }),
                 h4([], [label]),
                 div(['detail'], detail),
                 div(['progress'], [div(['progress-bar'], [])]),
                 div(['child-tasks'], [])
-            ]), {
+            ]).click(() => this.jumpToCell(id)), {
                 labelText: label,
                 detailText: detail,
                 status: status,
@@ -339,6 +350,14 @@ class KernelTasksEl extends Disposable {
 
             if (detail && typeof detail === "string") {
                 taskEl.attr('title', detail);
+            }
+
+            if (Object.keys(TaskStatus)[status] === "Error") {
+                taskEl.prepend(icon(['copy-button'], 'copy', 'copy icon').click(() => {
+                    const errCopy = copy?.();
+                    if (errCopy != undefined)
+                        copyToClipboard(errCopy);
+                }));
             }
 
             const container = (typeof parent !== "undefined" && (this.tasks[parent]?.querySelector('.child-tasks'))) || this.taskContainer;
@@ -359,6 +378,15 @@ class KernelTasksEl extends Disposable {
             }
         }
     }
+
+    private jumpToCell(id: string) {
+        const nbInfo = ServerStateHandler.getOrCreateNotebook(this.notebookPathHandler.state);
+        const idAsNum = id.split(" ").pop(); // extract the actual id number
+        if (idAsNum != undefined && !isNaN(parseInt(idAsNum))) { // Check there was a second word, and verify it is a number
+            nbInfo.handler.selectCell(parseInt(idAsNum));
+        }
+    }
+
     private setProgress(el: KernelTask, progress: number) {
         const progressBar = el.querySelector('.progress-bar') as HTMLElement;
         progressBar.style.width = (progress * 100 / 255).toFixed(0) + "%";
@@ -411,6 +439,16 @@ class KernelTasksEl extends Disposable {
         if (Object.keys(this.tasks).length === 0) {
             this.el.classList.remove('nonempty');
             this.cancelButton.disabled = true;
+        }
+    }
+
+    // Serves as a wrapper for canceling a task - if the cancel button is hit on a task that was running but crashed,
+    // its status will be checked so it can be safely removed from the UI.
+    private cancelTaskWrapper(id: string) {
+        if (this.tasks[id] !== undefined && this.tasks[id].status === TaskStatus.Error) {
+            this.removeTask(id);
+        } else {
+            this.dispatcher.cancelTask(id);
         }
     }
 }

@@ -12,6 +12,7 @@ import {
     float64,
     int16,
     int32,
+    int64,
     mapCodec,
     optional,
     Pair,
@@ -30,6 +31,8 @@ import {ContentEdit} from "./content_edit";
 import {Left, Right} from "./codec_types";
 import {deepEquals} from "../util/helpers";
 import {DoubleType, LongType, StructField, StructType} from "./data_type";
+
+const cellID = int16
 
 export abstract class Message extends CodecContainer {
     static codec: Codec<Message>;
@@ -99,7 +102,7 @@ export class NotebookCells extends Message {
 
 
 export class RunCell extends Message {
-    static codec = combined(arrayCodec(uint16, uint16)).to(RunCell);
+    static codec = combined(arrayCodec(uint16, cellID)).to(RunCell);
     static get msgTypeId() { return 3; }
 
     static unapply(inst: RunCell): ConstructorParameters<typeof RunCell> {
@@ -113,7 +116,7 @@ export class RunCell extends Message {
 }
 
 export class CellResult extends Message {
-    static codec = combined(int16, Result.codec).to(CellResult);
+    static codec = combined(cellID, Result.codec).to(CellResult);
     static get msgTypeId() { return 4; }
 
     static unapply(inst: CellResult): ConstructorParameters<typeof CellResult> {
@@ -162,7 +165,7 @@ export class NotebookUpdate extends Message {
 
 export class UpdateCell extends NotebookUpdate {
     static codec =
-        combined(uint32, uint32, int16, arrayCodec(uint16, ContentEdit.codec), optional(CellMetadata.codec)).to(UpdateCell);
+        combined(uint32, uint32, cellID, arrayCodec(uint16, ContentEdit.codec), optional(CellMetadata.codec)).to(UpdateCell);
     static get msgTypeId() { return 5; }
 
     static unapply(inst: UpdateCell): ConstructorParameters<typeof UpdateCell> {
@@ -177,7 +180,7 @@ export class UpdateCell extends NotebookUpdate {
 }
 
 export class InsertCell extends NotebookUpdate {
-    static codec = combined(uint32, uint32, NotebookCell.codec, int16).to(InsertCell);
+    static codec = combined(uint32, uint32, NotebookCell.codec, cellID).to(InsertCell);
     static get msgTypeId() { return 6; }
 
     static unapply(inst: InsertCell): ConstructorParameters<typeof InsertCell> {
@@ -199,7 +202,7 @@ export class InsertCell extends NotebookUpdate {
 }
 
 export class CreateComment extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16, CellComment.codec).to(CreateComment);
+    static codec = combined(uint32, uint32, cellID, CellComment.codec).to(CreateComment);
     static get msgTypeId() { return 29; }
 
     static unapply(inst: CreateComment): ConstructorParameters<typeof CreateComment> {
@@ -214,7 +217,7 @@ export class CreateComment extends NotebookUpdate {
 }
 
 export class UpdateComment extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16, tinyStr, PosRange.codec, shortStr).to(UpdateComment);
+    static codec = combined(uint32, uint32, cellID, tinyStr, PosRange.codec, shortStr).to(UpdateComment);
     static get msgTypeId() { return 30; }
 
     static unapply(inst: UpdateComment): ConstructorParameters<typeof UpdateComment> {
@@ -229,7 +232,7 @@ export class UpdateComment extends NotebookUpdate {
 }
 
 export class DeleteComment extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16, tinyStr).to(DeleteComment);
+    static codec = combined(uint32, uint32, cellID, tinyStr).to(DeleteComment);
     static get msgTypeId() { return 31; }
 
     static unapply(inst: DeleteComment): ConstructorParameters<typeof DeleteComment> {
@@ -268,7 +271,7 @@ export class CompletionCandidate {
 
 
 export class CompletionsAt extends Message {
-    static codec = combined(int16, int32, arrayCodec(uint16, CompletionCandidate.codec)).to(CompletionsAt);
+    static codec = combined(cellID, int32, arrayCodec(uint16, CompletionCandidate.codec)).to(CompletionsAt);
 
     static get msgTypeId() { return 7; }
 
@@ -316,7 +319,7 @@ export class Signatures {
 }
 
 export class ParametersAt extends Message {
-    static codec = combined(int16, int32, optional(Signatures.codec)).to(ParametersAt);
+    static codec = combined(cellID, int32, optional(Signatures.codec)).to(ParametersAt);
     static get msgTypeId() { return 8; }
 
     static unapply(inst: ParametersAt): ConstructorParameters<typeof ParametersAt> {
@@ -378,7 +381,7 @@ export class TaskInfo {
 }
 
 export class UpdatedTasks extends KernelStatusUpdate {
-    static codec = combined(arrayCodec(uint8, TaskInfo.codec)).to(UpdatedTasks);
+    static codec = combined(arrayCodec(uint16, TaskInfo.codec)).to(UpdatedTasks);
     static get msgTypeId() { return 1; }
 
     static unapply(inst: UpdatedTasks): ConstructorParameters<typeof UpdatedTasks> {
@@ -427,7 +430,7 @@ export class KernelInfo extends KernelStatusUpdate {
 }
 
 export class ExecutionStatus extends KernelStatusUpdate {
-    static codec = combined(int16, optional(PosRange.codec)).to(ExecutionStatus);
+    static codec = combined(cellID, optional(PosRange.codec)).to(ExecutionStatus);
     static get msgTypeId() { return 4; }
 
     static unapply(inst: ExecutionStatus): ConstructorParameters<typeof ExecutionStatus> {
@@ -460,7 +463,7 @@ export class PresenceUpdate extends KernelStatusUpdate {
 }
 
 export class PresenceSelection extends KernelStatusUpdate {
-    static codec = combined(int32, uint16, PosRange.codec).to(PresenceSelection);
+    static codec = combined(int32, cellID, PosRange.codec).to(PresenceSelection);
     static get msgTypeId() { return 6; }
     static unapply(inst: PresenceSelection): ConstructorParameters<typeof PresenceSelection> {
         return [inst.presenceId, inst.cellId, inst.range];
@@ -483,7 +486,7 @@ export class KernelError extends KernelStatusUpdate {
 }
 
 export class CellStatusUpdate extends KernelStatusUpdate {
-    static codec = combined(int16, uint8).to(CellStatusUpdate);
+    static codec = combined(cellID, uint8).to(CellStatusUpdate);
     static get msgTypeId() { return 8; }
 
     static unapply(inst: CellStatusUpdate): ConstructorParameters<typeof CellStatusUpdate> {
@@ -541,7 +544,7 @@ export class UpdateConfig extends NotebookUpdate {
 }
 
 export class SetCellLanguage extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16, tinyStr).to(SetCellLanguage);
+    static codec = combined(uint32, uint32, cellID, tinyStr).to(SetCellLanguage);
     static get msgTypeId() { return 11; }
     static unapply(inst: SetCellLanguage): ConstructorParameters<typeof SetCellLanguage> {
         return [inst.globalVersion, inst.localVersion, inst.id, inst.language];
@@ -572,27 +575,39 @@ export class StartKernel extends Message {
     static get Kill() { return 3; }
 }
 
+export class FSNotebook {
+    static codec = combined(shortStr, int64).to(FSNotebook);
+
+    static unapply(inst: FSNotebook): ConstructorParameters<typeof FSNotebook> {
+        return [inst.path, inst.lastSaved];
+    }
+
+    constructor(readonly path: string, readonly lastSaved: number) {
+        Object.freeze(this);
+    }
+}
+
 export class ListNotebooks extends Message {
-    static codec = combined(arrayCodec(int32, shortStr)).to(ListNotebooks);
+    static codec = combined(arrayCodec(int32, FSNotebook.codec)).to(ListNotebooks);
     static get msgTypeId() { return 13; }
     static unapply(inst: ListNotebooks): ConstructorParameters<typeof ListNotebooks> {
         return [inst.notebooks];
     }
 
-    constructor(readonly notebooks: string[]) {
+    constructor(readonly notebooks: FSNotebook[]) {
         super();
         Object.freeze(this);
     }
 }
 
 export class CreateNotebook extends Message {
-    static codec = combined(shortStr, optional(str)).to(CreateNotebook);
+    static codec = combined(shortStr, optional(str), optional(str)).to(CreateNotebook);
     static get msgTypeId() { return 14; }
     static unapply(inst: CreateNotebook): ConstructorParameters<typeof CreateNotebook> {
-        return [inst.path, inst.content];
+        return [inst.path, inst.content, inst.template];
     }
 
-    constructor(readonly path: string, readonly content?: string) {
+    constructor(readonly path: string, readonly content?: string, readonly template?: string) {
         super();
         Object.freeze(this);
     }
@@ -647,7 +662,7 @@ export class DeleteNotebook extends Message {
 }
 
 export class DeleteCell extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16).to(DeleteCell);
+    static codec = combined(uint32, uint32, cellID).to(DeleteCell);
     static get msgTypeId() { return 15; }
     static unapply(inst: DeleteCell): ConstructorParameters<typeof DeleteCell> {
         return [inst.globalVersion, inst.localVersion, inst.id];
@@ -676,13 +691,13 @@ export class Identity {
 }
 
 export class ServerHandshake extends Message {
-    static codec = combined(mapCodec(uint8, tinyStr, tinyStr), tinyStr, tinyStr, optional(Identity.codec), arrayCodec(int32, SparkPropertySet.codec)).to(ServerHandshake);
+    static codec = combined(mapCodec(uint8, tinyStr, tinyStr), tinyStr, tinyStr, optional(Identity.codec), arrayCodec(int32, SparkPropertySet.codec), arrayCodec(int32, shortStr), bool).to(ServerHandshake);
     static get msgTypeId() { return 16; }
     static unapply(inst: ServerHandshake): ConstructorParameters<typeof ServerHandshake> {
-        return [inst.interpreters, inst.serverVersion, inst.serverCommit, inst.identity, inst.sparkTemplates];
+        return [inst.interpreters, inst.serverVersion, inst.serverCommit, inst.identity, inst.sparkTemplates, inst.notebookTemplates, inst.notifications];
     }
 
-    constructor(readonly interpreters: Record<string, string>, readonly serverVersion: string, readonly serverCommit: string, readonly identity: Identity | null, readonly sparkTemplates: SparkPropertySet[]) {
+    constructor(readonly interpreters: Record<string, string>, readonly serverVersion: string, readonly serverCommit: string, readonly identity: Identity | null, readonly sparkTemplates: SparkPropertySet[], readonly notebookTemplates: string[], readonly notifications: boolean) {
         super();
         Object.freeze(this);
     }
@@ -882,7 +897,7 @@ export class ClearOutput extends Message {
 }
 
 export class SetCellOutput extends NotebookUpdate {
-    static codec = combined(uint32, uint32, int16, optional(Output.codec)).to(SetCellOutput);
+    static codec = combined(uint32, uint32, cellID, optional(Output.codec)).to(SetCellOutput);
     static get msgTypeId() { return 22; }
     static unapply(inst: SetCellOutput): ConstructorParameters<typeof SetCellOutput> {
         return [inst.globalVersion, inst.localVersion, inst.id, inst.output]
@@ -927,7 +942,7 @@ export class RunningKernels extends Message {
 }
 
 export class CurrentSelection extends Message {
-    static codec = combined(uint16, PosRange.codec).to(CurrentSelection);
+    static codec = combined(cellID, PosRange.codec).to(CurrentSelection);
     static get msgTypeId() { return 28; }
     static unapply(inst: CurrentSelection): ConstructorParameters<typeof CurrentSelection> {
         return [inst.cellID, inst.range];
@@ -953,7 +968,7 @@ export class KeepAlive extends Message {
 }
 
 export class MoveCell extends NotebookUpdate {
-    static codec = combined(uint32, uint32, uint16, int16).to(MoveCell);
+    static codec = combined(uint32, uint32, cellID, cellID).to(MoveCell);
     static get msgTypeId() { return 33; }
     static unapply(inst: MoveCell): ConstructorParameters<typeof MoveCell> {
         return [inst.globalVersion, inst.localVersion, inst.cellId, inst.after];
@@ -963,6 +978,97 @@ export class MoveCell extends NotebookUpdate {
         Object.freeze(this);
     }
 }
+
+export class NotebookSearchResult {
+    static codec = combined(shortStr, cellID, shortStr).to(NotebookSearchResult);
+
+    static unapply(inst: NotebookSearchResult): ConstructorParameters<typeof NotebookSearchResult> {
+        return [inst.path, inst.cellID, inst.cellContent];
+    }
+
+    constructor(readonly path: string, readonly cellID: number, readonly cellContent: string) {
+        Object.freeze(this);
+    }
+}
+
+export class SearchNotebooks extends Message {
+    static codec = combined(shortStr, arrayCodec(int32, NotebookSearchResult.codec)).to(SearchNotebooks);
+    static get msgTypeId() { return 34; }
+
+    static unapply(inst: SearchNotebooks): ConstructorParameters<typeof SearchNotebooks> {
+        return [inst.query, inst.results];
+    }
+
+    constructor(readonly query: string, readonly results: NotebookSearchResult[]) {
+        super();
+        Object.freeze(this);
+    }
+
+    isResponse(other: Message): boolean {
+        return other instanceof SearchNotebooks
+    }
+}
+
+export class NotebookSaved extends Message {
+    static codec = combined(shortStr, int64).to(NotebookSaved);
+    static get msgTypeId() { return 35; }
+
+    static unapply(inst: NotebookSaved): ConstructorParameters<typeof NotebookSaved> {
+        return [inst.path, inst.timestamp];
+    }
+
+    constructor(readonly path: string, readonly timestamp: number) {
+        super();
+        Object.freeze(this);
+    }
+
+    isResponse(other: Message): boolean {
+        return other instanceof NotebookSaved
+    }
+}
+
+export class GoToDefinitionRequest extends Message {
+    static codec = combined(either(str, cellID), int32, int32).to(GoToDefinitionRequest)
+    static get msgTypeId() { return 36; }
+
+    static unapply(inst: GoToDefinitionRequest): ConstructorParameters<typeof GoToDefinitionRequest> {
+        return [inst.path, inst.pos, inst.reqId]
+    }
+
+    constructor(readonly path: Left<string> | Right<number>, readonly pos: number, readonly reqId: number) {
+        super();
+        Object.freeze(this);
+    }
+
+    isResponse(other: Message): boolean {
+        return false;
+    }
+}
+
+export class Location {
+    static codec = combined(str, int32, int32).to(Location)
+
+    static unapply(inst: Location): ConstructorParameters<typeof Location> {
+        return [inst.uri, inst.line, inst.column];
+    }
+    constructor(readonly uri: string, readonly line: number, readonly column: number) {
+        Object.freeze(this);
+    }
+}
+
+export class GoToDefinitionResponse extends Message {
+    static codec = combined(int32, arrayCodec(uint8, Location.codec)).to(GoToDefinitionResponse);
+    static get msgTypeId() { return 37; }
+    static unapply(inst: GoToDefinitionResponse): ConstructorParameters<typeof GoToDefinitionResponse> {
+        return [inst.reqId, inst.location];
+    }
+
+    constructor(readonly reqId: number, readonly location: Location[]) {
+        super();
+        Object.freeze(this);
+    }
+}
+
 
 Message.codecs = [
     Error,            // 0
@@ -998,7 +1104,11 @@ Message.codecs = [
     UpdateComment,    // 30
     DeleteComment,    // 31
     KeepAlive,        // 32
-    MoveCell          // 33
+    MoveCell,         // 33
+    SearchNotebooks,  // 34
+    NotebookSaved,    // 35
+    GoToDefinitionRequest,  // 36
+    GoToDefinitionResponse, // 37
 ];
 
 

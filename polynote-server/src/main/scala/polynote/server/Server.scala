@@ -1,29 +1,27 @@
 package polynote.server
 
 import java.io.File
-import java.net.URLEncoder
+import java.net.{URLConnection, URLEncoder}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
-
-import fs2.concurrent.Topic
 import polynote.buildinfo.BuildInfo
 import polynote.app.{Args, Environment, MainArgs}
 import polynote.config.PolynoteConfig
-import polynote.kernel.environment.{Config, Env}
+import polynote.kernel.environment.{BroadcastMessage, Config, Env}
 import Env.LayerOps
 import polynote.kernel.logging.Logging
 import polynote.kernel.{BaseEnv, GlobalEnv, Kernel}
 import polynote.messages.Message
-import polynote.server.auth.IdentityProvider
+import polynote.server.auth.{IdentityProvider, UserIdentity}
 import uzhttp.server.ServerLogger
 import uzhttp.{HTTPError, Request, Response}
 import HTTPError.{Forbidden, InternalServerError, NotFound}
-import polynote.kernel.interpreter.Interpreter
+import polynote.kernel.util.Publish
 import polynote.server.repository.NotebookRepository
-import zio.{Has, IO, Task, URIO, ZIO, ZLayer, ZManaged}
+import zio.{Has, Hub, IO, Promise, Task, URIO, ZIO, ZLayer, ZManaged}
 import zio.blocking.{Blocking, effectBlocking}
-import sun.net.www.MimeTable
+import zio.stream.ZStream
 
 class Server {
   private lazy val currentPath = new File(System.getProperty("user.dir")).toPath
@@ -81,19 +79,17 @@ class Server {
       |before running Polynote. You are solely responsible for any breach, loss, or damage caused by running
       |this software insecurely.""".stripMargin
 
-  private val banner: String =
-    raw"""|
-          |  _____      _                   _
-          | |  __ \    | |                 | |
-          | | |__) |__ | |_   _ _ __   ___ | |_ ___
-          | |  ___/ _ \| | | | | '_ \ / _ \| __/ _ \
-          | | |  | (_) | | |_| | | | | (_) | ||  __/
-          | |_|   \___/|_|\__, |_| |_|\___/ \__\___|
-          |                __/ |
-          |               |___/
-          |
-          |""".stripMargin
-
+  private val banner: String = Seq(
+    "",
+    "  _____      _                   _",
+    " |  __ \\    | |                 | |",
+    " | |__) |__ | |_   _ _ __   ___ | |_ ___",
+    " |  ___/ _ \\| | | | | '_ \\ / _ \\| __/ _ \\",
+    " | |  | (_) | | |_| | | | | (_) | ||  __/",
+    " |_|   \\___/|_|\\__, |_| |_|\\___/ \\__\\___|",
+    "                __/ |",
+    "               |___/",
+    "").mkString(sys.props("line.separator"))
 
   def main: ZIO[AppEnv, String, Int] = {
     for {
@@ -103,6 +99,7 @@ class Server {
       _            <- Logging.warn(securityWarning)
       _            <- Logging.info(banner)
       _            <- Logging.info(s"Polynote version ${BuildInfo.version}")
+      _            <- Logging.setVerbosity(Logging.Verbosity.getVerbosityFromString(config.log.verbosity))
       _            <- serve(wsKey).orDie
     } yield 0
   }.provideSomeLayer[AppEnv](IdentityProvider.layer.orDie)
@@ -153,8 +150,8 @@ class Server {
 
         gzipped orElse nogzip orElse fromJar
       }.catchAll {
-        case err: HTTPError => ZIO.fail(err)
-        case err => Logging.error("Error serving file", err) *> ZIO.fail(InternalServerError("Error serving file", Some(err)))
+        case err: HTTPError => Logging.error(s"Error serving file: $name", err) *> ZIO.fail(err)
+        case err => Logging.error(s"Error serving file: $name", err) *> ZIO.fail(InternalServerError(s"Error serving file: $name", Some(err)))
       }
 
       val serveStatic: PartialFunction[Request, ZIO[RequestEnv, HTTPError, Response]] = {
@@ -179,8 +176,9 @@ class Server {
       for {
         _             <- initNotebookStorageDir().toManaged_
         authRoutes    <- IdentityProvider.authRoutes.toManaged_
-        broadcastAll  <- Topic[Task, Option[Message]](None).toManaged_  // used to broadcast messages to all connected clients
-        _             <- Env.addManagedLayer(NotebookManager.layer[BaseEnv with MainEnv with MainArgs](broadcastAll))
+        broadcastHub  <- Hub.unbounded[Message].toManaged(_.shutdown) // used to broadcast messages to all connected clients
+        broadcastAll   = Publish(broadcastHub).asInstanceOf[BroadcastMessage]
+        _             <- Env.addManagedLayer(NotebookManager.layer[BaseEnv with MainEnv with MainArgs](broadcastHub))
         authorize     <- IdentityProvider.authorize[RequestEnv].toManaged_
         staticHandler <- staticFiles
         address       <- ZIO(config.listen.toSocketAddress).toManaged_
@@ -191,8 +189,23 @@ class Server {
             val query = uri.getQuery
             if ((path startsWith "/ws") && (query == s"key=$wsKey")) {
               path.stripPrefix("/ws").stripPrefix("/") match {
-                case "" => authorize(req, SocketSession(inputFrames, broadcastAll).flatMap(output => Response.websocket(req, output)))
-                case rest => authorize(req, NotebookSession.stream(rest, inputFrames, broadcastAll).flatMap(output => Response.websocket(req, output)))
+                case "" => authorize(
+                  req,
+                  SocketSession(inputFrames, ZStream.fromHub(broadcastHub))
+                    .flatMap(output => Response.websocket(req, output))
+                    .provideSomeLayer[SessionEnv with NotebookManager](ZLayer.succeed(broadcastAll))
+                )
+                case rest =>
+                    authorize(
+                      req,
+                      ZIO.environment[RequestEnv with UserIdentity].flatMap {
+                        env =>
+                          val frames = ZStream.managed(NotebookSession.stream(rest, inputFrames, broadcastAll).provide(env))
+                            .flatten
+                          Response.websocket(req, frames)
+                      }
+                    )
+
               }
             } else ZIO.fail(Forbidden("Missing or incorrect key"))
         }.handleSome {
@@ -201,6 +214,20 @@ class Server {
             req.uri.getQuery match {
               case "download=true" => downloadFile(req.uri.getPath.stripPrefix("/notebook/"), req)
               case _ => getIndex.map(Response.html(_))
+            }
+          case req if req.uri.getPath startsWith "/dependency/" =>
+            val queryParams = Option(req.uri.getQuery).map(Server.parseQuery).getOrElse(Map.empty)
+            val result = for {
+              lang <- ZIO.fromOption(queryParams.get("lang").flatMap(_.headOption))
+              dep  <- ZIO.fromOption(queryParams.get("dependency").flatMap(_.headOption))
+              kernel <- NotebookManager.getKernel(req.uri.getPath.stripPrefix("/dependency/")).some
+              source <- kernel.dependencySource(lang, dep).catchAll {
+                err => Logging.error(err) *> ZIO.fail(None)
+              }
+            } yield Response.plain(source)
+
+            result.catchAll {
+              none => Logging.error(s"Request for a dependency source at ${req.uri} failed") *> ZIO.fail(NotFound(req.uri.toString))
             }
         } .handleSome(staticHandler)
           .handleSome(authRoutes)
@@ -218,7 +245,7 @@ object Server {
   type Routes = PartialFunction[Request, ZIO[BaseEnv with Config, HTTPError, Response]]
 
   object MimeTypes {
-    private val fromSystem = MimeTable.getDefaultTable
+    private val fromSystem = URLConnection.getFileNameMap
     private val explicit = Map(
       ".png" -> "image/png",
       ".js" -> "application/javascript",
@@ -238,4 +265,16 @@ object Server {
       }
     }
   }
+
+  /**
+    * Very simply (and not very robustly) parse a query string like "foo=wizzle&bar=wozzle". Returns a map of key to list
+    * of all values that appeared with that key. Parameters that aren't key/value (e.g. "foo&bar&baz") are treated as
+    * values of the empty key "".
+    */
+  def parseQuery(query: String): Map[String, List[String]] = query.split('&').toList.map {
+    param => param.indexOf('=') match {
+      case -1 => ("", param)
+      case n  => (param.substring(0, n), if (n < param.length - 1) param.substring(n + 1) else "")
+    }
+  }.groupBy(_._1).mapValues(_.map(_._2)).toMap
 }

@@ -102,8 +102,12 @@ class PySparkInterpreter(
        |    spark_python = os.path.join(spark_home, "python")
        |    sys.path.insert(1, spark_python)
        |    import glob
-       |    py4j_path = glob.glob(os.path.join(spark_home, 'python', 'lib', 'py4j-*.zip'))[0]  # we want to use the py4j distributed with pyspark
-       |    sys.path.insert(1, py4j_path)
+       |    py4j_dir = os.path.join(spark_home, 'python', 'lib')
+       |    try:
+       |        py4j_path = glob.glob(os.path.join(py4j_dir, 'py4j-*.zip'))[0]  # we want to use the py4j distributed with pyspark
+       |        sys.path.insert(1, py4j_path)
+       |    except IndexError as err:
+       |        raise IndexError('No py4j found using SPARK_HOME: ' + spark_home + ' searched in ' + py4j_dir)
        |
        |    pythonpath = os.pathsep.join(filter(lambda x: x is not None, [spark_python, py4j_path, os.environ.get("PYTHONPATH", None)]))
        |    os.environ["PYTHONPATH"] = pythonpath
@@ -218,7 +222,7 @@ class PySparkInterpreter(
            |__sparkConf = SparkConf(_jvm = gateway.jvm, _jconf = gateway.entry_point.sparkContext().getConf())
            |sc = SparkContext(jsc = gateway.jvm.org.apache.spark.api.java.JavaSparkContext(gateway.entry_point.sparkContext()), gateway = gateway, conf = __sparkConf)
            |spark = SparkSession(sc, gateway.entry_point)
-           |sqlContext = spark._wrapped
+           |sqlContext = spark._wrapped if hasattr(spark, '_wrapped') else SQLContext._get_or_create(sc)
            |from pyspark.sql import DataFrame
            |
            |

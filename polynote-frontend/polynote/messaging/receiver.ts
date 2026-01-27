@@ -18,7 +18,7 @@ import {
     valueToUpdate
 } from "../state";
 import * as messages from "../data/messages";
-import {Identity, Message, TaskInfo, TaskStatus} from "../data/messages";
+import {GoToDefinitionResponse, Identity, Message, TaskInfo, TaskStatus} from "../data/messages";
 import {CellComment, CellMetadata, NotebookCell, NotebookConfig} from "../data/data";
 import match, {purematch} from "../util/match";
 import {ContentEdit} from "../data/content_edit";
@@ -47,6 +47,9 @@ import {
 import {ClientBackup} from "../state/client_backup";
 import {ErrorStateHandler} from "../state/error_state";
 import {ServerState, ServerStateHandler} from "../state/server_state";
+import {posToRange} from "../util/helpers";
+import {IRange, languages, Uri} from "monaco-editor";
+import Definition = languages.Definition;
 
 export class MessageReceiver<S> extends Disposable {
     protected readonly socket: SocketStateHandler;
@@ -85,6 +88,11 @@ export class NotebookMessageReceiver extends MessageReceiver<NotebookState> {
     constructor(socketState: SocketStateHandler, notebookState: NotebookStateHandler) {
         super(socketState, notebookState);
         const updateHandler = notebookState.updateHandler;
+
+        this.receive(messages.Error, (s, code, err) => {
+            ErrorStateHandler.addKernelError(s.path, err);
+            return NoUpdate
+        });
 
         this.socket.view("status").addObserver(status => {
             if (status === "disconnected") {
@@ -127,6 +135,20 @@ export class NotebookMessageReceiver extends MessageReceiver<NotebookState> {
             } else {
                 console.warn("Got signature response but there was no activeSignature, this is a bit odd.", {cell, offset, signatures})
                 return NoUpdate
+            }
+        });
+        this.receive(messages.GoToDefinitionResponse, (s, reqId, location) => {
+            if (s.requestedDefinition) {
+                const definition: Definition = location.map(location => {
+                    const loc: languages.Location = {uri: Uri.parse(location.uri), range: posToRange(location)};
+                    return loc
+                })
+                s.requestedDefinition.resolve(new GoToDefinitionResponse(reqId, location));
+                return {
+                    requestedDefinition: destroy()
+                }
+            } else {
+                return NoUpdate;
             }
         });
         this.receive(messages.NotebookVersion, (s, path, serverGlobalVersion) => {
@@ -559,6 +581,9 @@ export class ServerMessageReceiver extends MessageReceiver<ServerState> {
             return {
                 notebooks: {
                     [path]: ServerStateHandler.getOrCreateNotebook(path).loaded
+                },
+                notebookTimestamps: {
+                    [path]: Date.now()
                 }
             }
         });
@@ -571,14 +596,19 @@ export class ServerMessageReceiver extends MessageReceiver<ServerState> {
             ServerStateHandler.deleteNotebook(path)
             return NoUpdate // `deleteNotebook` already takes care of updating the state.
         });
-        this.receive(messages.ListNotebooks, (s, paths) => {
+        this.receive(messages.ListNotebooks, (s, nbs) => {
             const notebooks = {...s.notebooks}
-            paths.forEach(path => {
-                notebooks[path] = ServerStateHandler.getOrCreateNotebook(path).loaded
+            const notebookTimestamps = {...s.notebookTimestamps};
+            nbs.forEach(nb => {
+                notebooks[nb.path] = ServerStateHandler.getOrCreateNotebook(nb.path).loaded
+                notebookTimestamps[nb.path] = Number(nb.lastSaved); // cast BigInt (uint64) to number
             })
-            return { notebooks: setValue(notebooks) }
+            return {
+                notebooks: setValue(notebooks),
+                notebookTimestamps: setValue(notebookTimestamps)
+            }
         });
-        this.receive(messages.ServerHandshake, (s, interpreters, serverVersion, serverCommit, identity, sparkTemplates) => {
+        this.receive(messages.ServerHandshake, (s, interpreters, serverVersion, serverCommit, identity, sparkTemplates, notebookTemplates, notifications) => {
             // First, we need to check to see if versions match. If they don't, we need to reload to clear out any
             // messed up state!
             if (s.serverVersion !== "unknown" && serverVersion !== s.serverVersion) {
@@ -591,12 +621,15 @@ export class ServerMessageReceiver extends MessageReceiver<ServerState> {
                     interpreters[key] = ClientInterpreters[key].languageTitle;
             });
 
+
             return {
                 interpreters: setValue(interpreters),
                 serverVersion: setValue(serverVersion),
                 serverCommit: setValue(serverCommit),
                 identity: setValue(identity ?? new Identity("Unknown User", null)),
                 sparkTemplates: setValue(sparkTemplates),
+                notebookTemplates: setValue(notebookTemplates),
+                notifications: setValue(notifications)
             }
         });
         this.receive(messages.RunningKernels, (s, kernelStatuses) => {
@@ -611,6 +644,16 @@ export class ServerMessageReceiver extends MessageReceiver<ServerState> {
                 notebooks.push(path)
             })
             return { serverOpenNotebooks: notebooks }
+        })
+        this.receive(messages.SearchNotebooks, (s, query, notebookSearchResults) => {
+            return { searchResults: notebookSearchResults }
+        })
+        this.receive(messages.NotebookSaved, (s, path, timestamp) => {
+            return {
+                notebookTimestamps: {
+                    [path]: Number(timestamp) // cast BigInt (uint64) to number
+                }
+            }
         })
     }
 }

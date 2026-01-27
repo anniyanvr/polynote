@@ -3,19 +3,26 @@ package interpreter
 package scal
 
 import java.lang.reflect.{Constructor, InvocationTargetException}
-
 import scala.reflect.internal.util.{NoPosition, Position}
 import scala.tools.nsc.interactive.Global
-import polynote.messages.CellID
+import polynote.messages.{CellID, DefinitionLocation}
 import zio.blocking.{Blocking, effectBlockingInterrupt}
 import zio.{RIO, Task, ZIO}
 import ScalaInterpreter.{addPositionUpdates, captureLastExpression}
-import polynote.kernel.environment.{CurrentNotebook, CurrentRuntime, CurrentTask}
+import polynote.config.PolynoteConfig
+import polynote.kernel.dependency.Artifact
+import polynote.kernel.environment.{Config, CurrentNotebook, CurrentRuntime, CurrentTask}
+import polynote.kernel.logging.Logging
 import polynote.kernel.task.TaskManager
+import zio.clock.Clock
+
+import java.net.URI
+import scala.reflect.io.FileZipArchive
 
 class ScalaInterpreter private[scal] (
   val scalaCompiler: ScalaCompiler,
-  indexer: ClassIndexer
+  indexer: ClassIndexer,
+  scan: Option[SemanticDbScan]
 ) extends Interpreter {
   import scalaCompiler.{CellCode, global, Imports}
   import global.{Tree, ValDef, TermName, Modifiers, EmptyTree, TypeTree, Import, Name, Type, Quasiquote, typeOf, atPos, NoType}
@@ -24,17 +31,29 @@ class ScalaInterpreter private[scal] (
   // Interpreter interface methods //
   ///////////////////////////////////
 
+  /**
+    * Because Polynote's shading tool doesn't know to re-write the classpath for shadow JARs in the Scala metadata,
+    * this is a short-term workaround to re-try a failed cell compilation a few times, which eventually causes the
+    * issue to resolve. Long-term, the best solution is to change how we do shading, or change the compile method to
+    * only retry for certain compilation errors.
+    */
   override def run(code: String, state: State): RIO[InterpreterEnv, State] = for {
-    collectedState <- injectState(collectState(state))
-    valDefs         = collectedState.values.mapValues(_._1).values.toList
-    cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", code, collectedState.prevCells, valDefs, collectedState.imports)
-      .flatMap(_.transformStats(transformCode).pruneInputs())
-    inputNames      = cellCode.inputs.map(_.name.decodedName.toString)
-    inputs          = inputNames.map(collectedState.values).map(_._2)
-    cls            <- scalaCompiler.compileCell(cellCode)
+    (cellCode, inputs, cls) <- compile(code, state)
     resultInstance <- cls.map(cls => runClass(cls, cellCode, inputs, state).map(Some(_))).getOrElse(ZIO.succeed(None))
     resultValues   <- resultInstance.map(resultInstance => getResultValues(state.id, cellCode, resultInstance)).getOrElse(ZIO.succeed(Nil))
   } yield ScalaCellState(state.id, state.prev, resultValues, cellCode, resultInstance)
+
+  private def compile(code: String, state: State) = {
+    for {
+      collectedState <- injectState(collectState(state))
+      valDefs = collectedState.values.mapValues(_._1).values.toList
+      cellCode <- scalaCompiler.cellCode(s"Cell${state.id.toString}", code, collectedState.prevCells, valDefs, collectedState.imports)
+        .flatMap(_.transformStats(transformCode).pruneInputs())
+      inputNames = cellCode.inputs.map(_.name.decodedName.toString)
+      inputs = inputNames.map(collectedState.values).map(_._2)
+      cls <- scalaCompiler.compileCell(cellCode)
+    } yield (cellCode, inputs, cls)
+  }.retryN(3)
 
   override def completionsAt(code: String, pos: Int, state: State): RIO[Blocking, List[Completion]] = for {
     collectedState   <- injectState(collectState(state)).provideLayer(CurrentRuntime.noRuntime)
@@ -50,9 +69,37 @@ class ScalaInterpreter private[scal] (
     hints          <- completer.paramHints(cellCode, pos + 2)
   } yield hints
 
+  override def goToDefinition(code: String, pos: Int, state: State): RIO[BaseEnv with CellEnv, List[DefinitionLocation]] = for {
+    collectedState <- injectState(collectState(state)).provideLayer(CurrentRuntime.noRuntime)
+    valDefs         = collectedState.values.mapValues(_._1).values.toList
+    cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n\n$code  ", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
+    locations      <- completer.locateDefinitions(cellCode, pos)
+  } yield locations
+
+  override def goToDependencyDefinition(uri: String, pos: Int): RIO[BaseEnv, List[DefinitionLocation]] =
+    completer.locateDefinitionsFromDependency(uri, pos)
+
   override def init(state: State): RIO[InterpreterEnv, State] = ZIO.succeed(state)
 
   override def shutdown(): Task[Unit] = ZIO.unit
+
+  override def fileExtensions: Set[String] = Set("scala", "java")
+
+  override def getDependencyContent(uri: String): RIO[Blocking, String] = ZIO {
+    val parsed = new URI(uri)
+    val Seq(jarName, filePath) = parsed.getPath.stripPrefix("/").split('!').toSeq
+    val fileDirParts :+ fileName = filePath.split('/').toSeq
+    for {
+      artifact  <- scalaCompiler.dependencies.find(_.source.exists(_.getName == jarName))
+      source    <- artifact.source
+      insidePath = fileDirParts.mkString("/") + "/"
+      dirEntry  <- new FileZipArchive(source).allDirs.getOpt(insidePath)
+      fileEntry <- dirEntry.entries.getOpt(fileName)
+    } yield fileEntry
+  }.someOrFailException.flatMap {
+    entry =>
+      ZIO(new String(entry.toCharArray))
+  }
 
   ///////////////////////////////////////
   // Overrideable scala-specific stuff //
@@ -94,7 +141,7 @@ class ScalaInterpreter private[scal] (
   // Private scala-specific stuff //
   //////////////////////////////////
 
-  private val completer = ScalaCompleter(scalaCompiler, indexer)
+  private val completer = ScalaCompleter(scalaCompiler, indexer, scan)
 
   // for testing reliably
   private[scal] def awaitIndexer = indexer.await
@@ -210,10 +257,21 @@ class ScalaInterpreter private[scal] (
 
 object ScalaInterpreter {
 
-  def apply(): RIO[Blocking with ScalaCompiler.Provider, ScalaInterpreter] = for {
+  def maybeScan(compiler: ScalaCompiler): RIO[BaseEnv with Config with TaskManager, Option[SemanticDbScan]] =
+    Config.access.flatMap {
+      case config if config.downloadSources =>
+        for {
+          scan <- ZIO(new SemanticDbScan(compiler))
+          _    <- scan.init.forkDaemon
+        } yield Some(scan)
+      case _ => ZIO.none
+    }
+
+  def apply(): RIO[BaseEnv with Config with TaskManager with ScalaCompiler.Provider, ScalaInterpreter] = for {
     compiler <- ScalaCompiler.access
     index    <- ClassIndexer.default
-  } yield new ScalaInterpreter(compiler, index)
+    scan     <- maybeScan(compiler)
+  } yield new ScalaInterpreter(compiler, index, scan)
 
   // capture the last statement in a value Out, if it's a free expression
   def captureLastExpression(global: Global)(trees: List[global.Tree]): List[global.Tree] = {

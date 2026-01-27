@@ -78,6 +78,7 @@ export interface OptionalStateHandler<S> extends OptionalStateView<S>, Updatable
     fork(disposeContext?: IDisposable): OptionalStateHandler<S>
 }
 
+// wraps an Observer such that it will only be called if the updateSource passes the filter
 function filterObserver<S>(fn: Observer<S>, filter?: (src: any) => boolean): Observer<S> {
     if (!filter)
         return fn;
@@ -88,6 +89,7 @@ function filterObserver<S>(fn: Observer<S>, filter?: (src: any) => boolean): Obs
     }
 }
 
+// wraps a PreObserver such that its inner Observer will only be called if updateSource passes the filter
 function filterPreObserver<S>(fn: PreObserver<S>, filter?: (src: any) => boolean): PreObserver<S> {
     if (!filter)
         return fn;
@@ -101,10 +103,11 @@ function filterPreObserver<S>(fn: PreObserver<S>, filter?: (src: any) => boolean
     }
 }
 
+// returns an Observer that calls down to child Observers upon receiving an update
 function keyObserver<S, K extends keyof S, V extends S[K] = S[K]>(key: K, fn: Observer<V>, filter?: (src: any) => boolean): Observer<S> {
     return (value, result, updateSource) => {
         const down = childResult(result, key);
-        if (!(down.update instanceof Destroy) && down.update !== NoUpdate) {
+        if (!(down.update instanceof Destroy) && down.update !== NoUpdate) { // stop propagating updates to child observers if a key is deleted
             if (!filter || filter(updateSource)) {
                 fn(value[key as keyof S] as V, down as UpdateResult<V>, updateSource)
             }
@@ -117,7 +120,7 @@ function keyPreObserver<S, K extends keyof S, V extends S[K] = S[K]>(key: K, fn:
         const obs = fn(preS[key as keyof S] as V);
         return (value, result, updateSource) => {
             const down = childResult(result, key);
-            if (down && down.update !== NoUpdate) {
+            if (!(down.update instanceof Destroy) && down.update !== NoUpdate) { // stop propagating updates to child observers if a key is deleted
                 if (!filter || filter(updateSource)) {
                     obs(value[key] as V, down as UpdateResult<V>, updateSource)
                 }
@@ -156,6 +159,7 @@ class ObserverDict<T> {
         return this.addAt(observer, cleanPath(path))
     }
 
+    // recursively add ObserverDicts at each level of a path (e.g. cells -> index of cell -> comments -> comment uuid)
     private addAt(observer: T, path: string[]): IDisposable {
         if (path.length === 0) {
             const disposable = mkDisposable(observer, () => {
@@ -267,6 +271,8 @@ export class ObjectStateHandler<S extends object> extends Disposable implements 
             return;
         }
 
+        // pass each preObserver the current state (before applying the update) and push the observers that they return
+        //      into a list
         const preObservers = this.preObservers.collect(updatePath, obs => obs(this.state));
 
         const updateResult = update.applyMutate(this.mutableState);
@@ -279,6 +285,7 @@ export class ObjectStateHandler<S extends object> extends Disposable implements 
         if (updateResult.update !== NoUpdate) {
             if (this.sourceFilter(updateSource)) {
                 const src = updateSource ?? this;
+                // pass the new state to both the observers and the functions returned from collecting preObservers
                 preObservers.forEach(observer => observer(this.state, updateResult, src));
                 this.observers.forEach(updatePath, observer => observer(this.state, updateResult, src));
             }
@@ -318,13 +325,16 @@ export class ObjectStateHandler<S extends object> extends Disposable implements 
     }
 
     updateField<K extends keyof S>(key: K, updateFn: Updater<S[K]>, updateSource?: any, updateSubPath?: string): void {
-        this.update(keyUpdater(key, updateFn), updateSource, `${key}.` + (updateSubPath ?? ''))
+        this.update(keyUpdater(key, updateFn), updateSource, `${key.toString()}.` + (updateSubPath ?? ''))
     }
 
+    // adds an Observer at a given path that is disposed when this handler is disposed
+    // returns a Disposable so callers can add introduce additional disposal criteria
     private addObserverAt(fn: Observer<S>, path: string): IDisposable {
         return this.observers.add(fn, path).disposeWith(this);
     }
 
+    // returns a Disposable that will remove itself from the PreObservers ObserverDict when disposed
     private addPreObserverAt(fn: PreObserver<S>, path: string): IDisposable {
         return this.preObservers.add(fn, path).disposeWith(this);
     }
@@ -340,14 +350,14 @@ export class ObjectStateHandler<S extends object> extends Disposable implements 
     observeKey<K extends keyof S>(key: K, fn: Observer<S[K]>, subPath?: string): IDisposable {
         return this.addObserverAt(
             keyObserver(key, fn),
-            `${key}.` + (subPath ?? '')
+            `${key.toString()}.` + (subPath ?? '')
         )
     }
 
     preObserveKey<K extends keyof S>(key: K, fn: PreObserver<S[K]>, subPath?: string): IDisposable {
         return this.addPreObserverAt(
             keyPreObserver(key, fn),
-            `${key}.` + (subPath ?? '')
+            `${key.toString()}.` + (subPath ?? '')
         )
     }
 
@@ -514,11 +524,11 @@ class KeyView<S, K extends keyof S> extends Disposable implements StateView<S[K]
     }
 
     observeKey<K1 extends keyof S[K]>(key: K1, fn: Observer<S[K][K1]>, subPath?: string): IDisposable {
-        return this.parent.observeKey(this.key, keyObserver(key, fn, this.sourceFilter), `${key}.` + (subPath ?? '')).disposeWith(this);
+        return this.parent.observeKey(this.key, keyObserver(key, fn, this.sourceFilter), `${key.toString()}.` + (subPath ?? '')).disposeWith(this);
     }
 
     preObserveKey<K1 extends keyof S[K]>(key: K1, fn: PreObserver<S[K][K1]>, subPath?: string): IDisposable {
-        return this.parent.preObserveKey(this.key, keyPreObserver(key, fn, this.sourceFilter), `${key}.` + (subPath ?? '')).disposeWith(this);
+        return this.parent.preObserveKey(this.key, keyPreObserver(key, fn, this.sourceFilter), `${key.toString()}.` + (subPath ?? '')).disposeWith(this);
     }
 
     observeMapped<T>(mapper: (value: S[K]) => T, fn: (mapped: T) => void, path?: string): IDisposable {
@@ -562,13 +572,13 @@ class KeyLens<S, K extends keyof S> extends KeyView<S, K> implements StateHandle
     }
 
     updateAsync(updateFn: Updater<S[K]>, updateSource?: any, updatePath?: string): Promise<Readonly<S[K]>> {
-        return this.parent.updateAsync(keyUpdater(this.key, updateFn), updateSource, `${this.key}.` + (updatePath ?? '')).then(
+        return this.parent.updateAsync(keyUpdater(this.key, updateFn), updateSource, `${this.key.toString()}.` + (updatePath ?? '')).then(
             s => s[this.key]
         )
     }
 
     updateField<K1 extends keyof S[K]>(key: K1, updateFn: Updater<S[K][K1]>, updateSource?: any, updateSubPath?: string) {
-        return this.parent.updateField(this.key, keyUpdater(key, updateFn), updateSource, `${key}.` + (updateSubPath ?? ''))
+        return this.parent.updateField(this.key, keyUpdater(key, updateFn), updateSource, `${key.toString()}.` + (updateSubPath ?? ''))
     }
 
     filterSource(filter: (source: any) => boolean): StateHandler<S[K]> {
@@ -589,7 +599,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
     }
 
     get state(): V | undefined {
-        return this.parent.state !== undefined ? this.parent.state[this.key] as V : undefined;
+        return this.parent.state !== undefined ? this.parent.state?.[this.key] as V : undefined;
     }
 
     addObserver(fn: Observer<V | undefined>, path?: string): IDisposable {
@@ -598,7 +608,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                 (parentValue, updateResult, updateSource) => {
                     if (parentValue !== undefined) {
                         fn(
-                            parentValue[this.key] as V,
+                            parentValue?.[this.key] as V,
                             childResult<S, K, V>(updateResult, this.key),
                             updateSource);
                     } else {
@@ -606,7 +616,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                     }
                 },
                 this.sourceFilter
-            ), `${this.key}.` + (path ?? '')).disposeWith(this);
+            ), `${this.key.toString()}.` + (path ?? '')).disposeWith(this);
     }
 
     addPreObserver(fn: PreObserver<V | undefined>, path?: string): IDisposable {
@@ -617,7 +627,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                     return (parentValue, updateResult, updateSource) => {
                         if (parentValue !== undefined) {
                             obs(
-                                parentValue[this.key] as V,
+                                parentValue?.[this.key] as V,
                                 childResult<S, K, V>(updateResult, this.key),
                                 updateSource);
                         } else {
@@ -626,7 +636,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                     }
                 },
                 this.sourceFilter
-            ), `${this.key}.` + (path ?? '')).disposeWith(this);
+            ), `${this.key.toString()}.` + (path ?? '')).disposeWith(this);
     }
 
     observeKey<K1 extends keyof V>(childKey: K1, fn: Observer<V[K1] | undefined>, subPath?: string): IDisposable {
@@ -634,9 +644,9 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
             filterObserver(
                 (parentValue, parentResult, updateSource) => {
                     if (parentValue !== undefined) {
-                        const value: V = parentValue[this.key] as V;
+                        const value: V = parentValue?.[this.key] as V;
                         const result: UpdateResult<V> = childResult<S, K, V>(parentResult as UpdateResult<S>, this.key)
-                        if (value !== undefined) {
+                        if (value !== undefined && value !== null) {
                             const childValue: V[K1] = value[childKey];
                             const childUpdateResult = childResult(result, childKey);
                             fn(childValue, childUpdateResult, updateSource);
@@ -648,7 +658,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                     }
                 },
                 this.sourceFilter
-            ), `${this.key}.${childKey}` + (subPath ?? '')).disposeWith(this)
+            ), `${this.key.toString()}.${childKey.toString()}` + (subPath ?? '')).disposeWith(this)
     }
 
     preObserveKey<K1 extends keyof V>(childKey: K1, fn: PreObserver<V[K1] | undefined>, subPath?: string): IDisposable {
@@ -657,10 +667,10 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                 prev => {
                     const obs = fn((prev?.[this.key] as V | undefined)?.[childKey]);
                     return (parentValue, parentResult, updateSource) => {
-                        if (parentValue !== undefined) {
+                        if (parentValue !== undefined && parentValue !== null) {
                             const value: V = parentValue[this.key] as V;
                             const result: UpdateResult<V> = childResult<S, K, V>(parentResult as UpdateResult<S>, this.key)
-                            if (value !== undefined) {
+                            if (value !== undefined && value !== null) {
                                 const childValue: V[K1] = value[childKey]
                                 const childUpdateResult = childResult<V, K1>(result, childKey);
                                 obs(childValue, childUpdateResult, updateSource);
@@ -673,7 +683,7 @@ class OptionalKeyView<S, K extends keyof S, V extends Exclude<S[K], undefined> =
                     }
                 },
                 this.sourceFilter
-            ), `${this.key}.${childKey}` + (subPath ?? '')).disposeWith(this)
+            ), `${this.key.toString()}.${childKey.toString()}` + (subPath ?? '')).disposeWith(this)
     }
 
     observeMapped<T>(mapper: (value: (V | undefined)) => T, fn: (mapped: T) => void, path?: string): IDisposable {
@@ -718,13 +728,13 @@ class OptionalKeyLens<S, K extends keyof S, V extends Exclude<S[K], undefined> =
     }
 
     updateAsync(updateFn: Updater<V | undefined>, updateSource?: any, updatePath?: string): Promise<Readonly<V | undefined>> {
-        return this.parent.updateAsync(keyUpdater(this.key, updateFn as Updater<S[K]>), updateSource, `${this.key}.` + (updatePath ?? '')).then(
+        return this.parent.updateAsync(keyUpdater(this.key, updateFn as Updater<S[K]>), updateSource, `${this.key.toString()}.` + (updatePath ?? '')).then(
             maybeS => maybeS !== undefined ? maybeS[this.key] as V | undefined : undefined
         )
     }
 
     updateField<K1 extends keyof V>(childKey: K1, updateFn: Updater<V[K1] | undefined>, updateSource?: any, updateSubPath?: string): void {
-        return this.parent.updateField(this.key, keyUpdater<V, K1>(childKey, updateFn as Updater<V[K1]>), updateSource, `${childKey}.` + (updateSubPath ?? ''))
+        return this.parent.updateField(this.key, keyUpdater<V, K1>(childKey, updateFn as Updater<V[K1]>), updateSource, `${childKey.toString()}.` + (updateSubPath ?? ''))
     }
 
     filterSource(filter: (source: any) => boolean): OptionalStateHandler<V> {
@@ -813,7 +823,7 @@ export class ProxyStateView<S> extends Disposable implements StateView<S> {
     observeKey<K extends keyof S>(key: K, fn: Observer<S[K]>, subPath?: string): IDisposable {
         return this.addObserver(
             keyObserver<S, K, S[K]>(key, fn),
-            `${key}.` + (subPath ?? '')
+            `${key.toString()}.` + (subPath ?? '')
         );
     }
 
@@ -824,7 +834,7 @@ export class ProxyStateView<S> extends Disposable implements StateView<S> {
     preObserveKey<K extends keyof S>(key: K, fn: PreObserver<(S)[K]>, subPath?: string): IDisposable {
         return this.addPreObserver(
             keyPreObserver(key, fn),
-            `${key}.` + (subPath ?? '')
+            `${key.toString()}.` + (subPath ?? '')
         )
     }
 

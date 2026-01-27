@@ -12,7 +12,7 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
   "PolynoteConfig" should "Ser/De" in {
 
     val cfg = PolynoteConfig(
-      Listen(), KernelConfig(), Storage(), List(maven("foo")), List("exclude!"), Map("foo" -> List("bar", "baz")), Some(SparkConfig(Map("key" -> "val")))
+      Listen(), KernelConfig(), Storage(), List(maven("foo")), List("exclude!"), Map("foo" -> List("bar", "baz")), true, Some(SparkConfig(Map("key" -> "val")))
     )
     val js = cfg.asJson
     val cfgString = cfg.asJson.spaces2
@@ -28,6 +28,10 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |listen:
         |  host: 1.1.1.1
         |  port: 8193
+        |
+        |# The logger verbosity level: info, warn, error (default: info)
+        |log:
+        |  verbosity: error
         |
         |# The host and port range for server/kernel communication
         |kernel:
@@ -99,10 +103,12 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
       ),
       List("org.typelevel", "com.mycompany"),
       Map("scala" -> List("org.typelevel:cats-core_2.11:1.6.0", "com.mycompany:my-library:jar:all:1.0.0")),
+      false,
       Some(SparkConfig(Map("spark.driver.userClasspathFirst" -> "true", "spark.executor.userClasspathFirst" -> "true"), Some("testing"))),
       credentials = Credentials(
         coursier = Some(Credentials.Coursier("~/.config/coursier/credentials.properties"))
-      )
+      ),
+      log= Log(verbosity="error")
     )
 
   }
@@ -125,11 +131,22 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |      properties:
         |        something: thing
         |        another:   one
-        |      spark_submit_args: some more args
-        |
+        |      version_configs:
+        |        - version_number: some version
+        |          version_properties:
+        |            arbitrary.spark.args: anything
+        |          spark_submit_args: some args
+        |        - version_number: some version 2
+        |          version_properties:
+        |             arbitrary.spark.args: anything else
+        |          spark_submit_args: different submit args
         |    - name: Test 2
         |      properties:
         |        something: thing2
+        |    - name: Old config format
+        |      properties:
+        |        something: thingOld
+        |      spark_submit_args: spark args
         |""".stripMargin
 
     // Pattern has no equals :(
@@ -138,8 +155,18 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
     parsed.sparkSubmitArgs shouldEqual Some("these are the args")
     parsed.distClasspathFilter.get.pattern() shouldEqual ".jar$"
     parsed.propertySets.get shouldEqual List(
-      SparkPropertySet(name = "Test", properties = Map("something" -> "thing", "another" -> "one"), sparkSubmitArgs = Some("some more args"), None),
-      SparkPropertySet(name = "Test 2", properties = Map("something" -> "thing2"))
+      SparkPropertySet(
+        name = "Test",
+        properties = Map("something" -> "thing", "another" -> "one"),
+        sparkSubmitArgs = None,
+        versionConfigs = Some(List(
+          ScalaVersionConfig("some version", Map("arbitrary.spark.args" -> "anything"), sparkSubmitArgs = Some("some args"), sparkVersion = "3.3"),
+          ScalaVersionConfig("some version 2", Map("arbitrary.spark.args" -> "anything else"), sparkSubmitArgs = Some("different submit args"), sparkVersion = "3.3")
+        )),
+        distClasspathFilter = None
+      ),
+      SparkPropertySet(name = "Test 2", properties = Map("something" -> "thing2"), sparkSubmitArgs = None, versionConfigs = None, distClasspathFilter = None),
+      SparkPropertySet(name = "Old config format", properties = Map("something" -> "thingOld"), sparkSubmitArgs = Some("spark args"), versionConfigs = None, distClasspathFilter = None)
     )
     parsed.pyspark.get.distributionExcludes shouldEqual List("foo", "bar")
     parsed.pyspark.get.distributeDependencies shouldEqual Option(true)
@@ -152,7 +179,6 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |""".stripMargin
 
     val Left(err) = PolynoteConfig.parse(badYaml)
-    assert(err.getMessage contains "Configuration is invalid")
     assert(err.getMessage contains "Invalid regular expression")
   }
 
@@ -170,6 +196,18 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
     parsed.right.value.behavior.sharedPackages shouldEqual List("com.esotericsoftware.kryo", "org.myclass")
     parsed.right.value.behavior.getSharedString shouldEqual
       "^(com.esotericsoftware.kryo|org.myclass|scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j)\\."
+  }
+
+  it should "Parse template notebooks" in {
+    val yamlStr =
+      """
+        |behavior:
+        |   notebook_templates:
+        |     - hello_world.ipynb
+        |     - another_template_notebook.ipynb
+        |""".stripMargin
+    val parsed = PolynoteConfig.parse(yamlStr)
+    parsed.right.value.behavior.notebookTemplates shouldEqual List("hello_world.ipynb", "another_template_notebook.ipynb")
   }
 
   it should "handle empty configurations" in {
@@ -210,5 +248,61 @@ class PolynoteConfigSpec extends FlatSpec with Matchers with EitherValues {
         |""".stripMargin
     val parsed = PolynoteConfig.parse(yamlStr)
     parsed.right.value.spark.get.properties("spark.some.decimal") shouldEqual "1.523432422343"
+  }
+
+  it should "parse notification config values properly" in {
+    val yamlStr =
+      """
+        |notifications: release_notifications
+        |""".stripMargin
+    val parsed = PolynoteConfig.parse(yamlStr)
+    parsed.right.value.notifications shouldEqual "release_notifications"
+  }
+
+  it should "parse spark version in version configs" in {
+    val yamlStr =
+      """
+        |spark:
+        |  property_sets:
+        |    - name: BDP / Spark 3.5
+        |      properties:
+        |        spark.driver.memory: 4g
+        |      version_configs:
+        |        - version_number: "2.12"
+        |          spark_version: "3.5"
+        |          version_properties:
+        |            spark.executor.memory: 2g
+        |        - version_number: "2.13"
+        |          spark_version: "3.5"
+        |          version_properties:
+        |            spark.executor.memory: 1g
+        |    - name: BDP / Spark 3.3
+        |      properties:
+        |        spark.driver.memory: 2g
+        |      version_configs:
+        |        - version_number: "2.12"
+        |          spark_version: "3.3"
+        |        - version_number: "2.13"
+        |          version_properties:
+        |            spark.executor.memory: 512m
+        |""".stripMargin
+    val parsed = PolynoteConfig.parse(yamlStr)
+    val propertySets = parsed.right.value.spark.get.propertySets.get
+
+    // First property set: BDP / Spark 3.5
+    propertySets(0).name shouldEqual "BDP / Spark 3.5"
+    val versionConfigs1 = propertySets(0).versionConfigs.get
+    versionConfigs1(0).versionNumber shouldEqual "2.12"
+    versionConfigs1(0).sparkVersion shouldEqual "3.5"
+    versionConfigs1(1).versionNumber shouldEqual "2.13"
+    versionConfigs1(1).sparkVersion shouldEqual "3.5"
+
+    // Second property set: BDP / Spark 3.3
+    propertySets(1).name shouldEqual "BDP / Spark 3.3"
+    val versionConfigs2 = propertySets(1).versionConfigs.get
+    versionConfigs2(0).versionNumber shouldEqual "2.12"
+    versionConfigs2(0).sparkVersion shouldEqual "3.3"
+    versionConfigs2(1).versionNumber shouldEqual "2.13"
+    versionConfigs2(1).sparkVersion shouldEqual "3.3"  // defaults to 3.3 when not specified
   }
 }

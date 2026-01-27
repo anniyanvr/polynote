@@ -6,6 +6,7 @@ import {
     combined,
     discriminated,
     int16,
+    int32,
     int64,
     mapCodec,
     optional,
@@ -18,12 +19,12 @@ import {
 import {ExecutionInfo, PosRange, Result} from "./result";
 
 export class CellMetadata {
-    static codec = combined(bool, bool, bool, optional(ExecutionInfo.codec)).to(CellMetadata);
+    static codec = combined(bool, bool, bool, bool, bool, optional(ExecutionInfo.codec)).to(CellMetadata);
     static unapply(inst: CellMetadata): ConstructorParameters<typeof CellMetadata> {
-        return [inst.disableRun, inst.hideSource, inst.hideOutput, inst.executionInfo];
+        return [inst.disableRun, inst.hideSource, inst.hideOutput, inst.splitDisplay, inst.wrapOutput, inst.executionInfo];
     }
 
-    constructor(readonly disableRun: boolean = false, readonly hideSource: boolean = false, readonly hideOutput: boolean = false, readonly executionInfo: ExecutionInfo | null = null) {
+    constructor(readonly disableRun: boolean = false, readonly hideSource: boolean = false, readonly hideOutput: boolean = false, readonly splitDisplay: boolean = false, readonly wrapOutput: boolean = false, readonly executionInfo: ExecutionInfo | null = null) {
         Object.freeze(this);
     }
 
@@ -31,8 +32,10 @@ export class CellMetadata {
         const disableRun = metadata.disableRun ?? this.disableRun;
         const hideSource = metadata.hideSource ?? this.hideSource;
         const hideOutput = metadata.hideOutput ?? this.hideOutput;
+        const splitDisplay = metadata.splitDisplay ?? this.splitDisplay;
+        const wrapOutput = metadata.wrapOutput ?? this.wrapOutput;
         const executionInfo = metadata.executionInfo ?? this.executionInfo;
-        return new CellMetadata(disableRun, hideSource, hideOutput, executionInfo);
+        return new CellMetadata(disableRun, hideSource, hideOutput, splitDisplay, wrapOutput, executionInfo);
     }
 }
 
@@ -58,7 +61,7 @@ export class NotebookCell {
                 readonly language: string,
                 readonly content: string = '',
                 readonly results: Result[] = [],
-                readonly metadata: CellMetadata = new CellMetadata(false, false, false),
+                readonly metadata: CellMetadata = new CellMetadata(false, false, false, false),
                 readonly comments: Record<string, CellComment> = {}) {
         Object.freeze(this);
     }
@@ -69,7 +72,16 @@ export abstract class RepositoryConfig extends CodecContainer {
     static codecs: typeof RepositoryConfig[];
     static msgTypeId: number;
 
-    abstract url: string
+    abstract url: string;
+    abstract repositoryTypeName: RepositoryTypeNames;
+
+    // enable parsing when copy-pasting configurations
+    toJSON(): WrappedResolver {
+        return {
+            type: this.repositoryTypeName,
+            resolver: {...this}
+        }
+    }
 }
 
 export class IvyRepository extends RepositoryConfig {
@@ -80,6 +92,10 @@ export class IvyRepository extends RepositoryConfig {
 
     static get msgTypeId() {
         return 0;
+    }
+
+    get repositoryTypeName(): RepositoryTypeNames {
+        return "ivy";
     }
 
     constructor(readonly url: string, readonly artifactPattern?: string, readonly metadataPattern?: string, readonly changing?: boolean) {
@@ -98,6 +114,10 @@ export class MavenRepository extends RepositoryConfig {
         return 1;
     }
 
+    get repositoryTypeName(): RepositoryTypeNames {
+        return "maven";
+    }
+
     constructor(readonly url: string, readonly changing?: boolean) {
         super();
         Object.freeze(this);
@@ -114,11 +134,22 @@ export class PipRepository extends RepositoryConfig {
         return 2;
     }
 
+    get repositoryTypeName(): RepositoryTypeNames {
+        return "pip";
+    }
+
     constructor(readonly url: string) {
         super();
         Object.freeze(this);
     }
 }
+
+export type RepositoryTypeNames = "ivy" | "maven" | "pip";
+
+export type WrappedResolver = {
+    type: RepositoryTypeNames,
+    resolver: RepositoryConfig
+};
 
 RepositoryConfig.codecs = [
     IvyRepository,   // 0
@@ -131,20 +162,40 @@ RepositoryConfig.codec = discriminated(
     (msgTypeId) => RepositoryConfig.codecs[msgTypeId].codec,
     msg => (msg.constructor as typeof RepositoryConfig).msgTypeId);
 
-export class SparkPropertySet {
-    static codec = combined(str, mapCodec(uint16, str as Codec<string>, str), optional(str), optional(str)).to(SparkPropertySet);
-    static unapply(inst: SparkPropertySet): ConstructorParameters<typeof SparkPropertySet> {
-        return [inst.name, inst.properties, inst.sparkSubmitArgs, inst.distClasspathFilter];
+export class VersionConfig {
+    static codec = combined(str, mapCodec(uint16, str as Codec<string>, str), optional(str), str).to(VersionConfig);
+
+    static unapply(inst: VersionConfig): ConstructorParameters<typeof VersionConfig> {
+        return [inst.versionName, inst.versionProperties, inst.sparkSubmitArgs, inst.sparkVersion];
     }
 
-    constructor(readonly name: string, readonly properties: Record<string, string>, readonly sparkSubmitArgs?: string, readonly distClasspathFilter?: string) {
+    constructor(readonly versionName: string, readonly versionProperties: Record<string, string>, readonly sparkSubmitArgs?: string, readonly sparkVersion: string = "3.3") {
+        Object.freeze(this);
+    }
+}
+
+export class SparkPropertySet {
+    static codec = combined(
+      str,
+      mapCodec(uint16, str as Codec<string>, str),
+      optional(str),
+      optional(arrayCodec(int32, VersionConfig.codec)),
+      optional(str)
+    ).to(SparkPropertySet);
+    static unapply(inst: SparkPropertySet): ConstructorParameters<typeof SparkPropertySet> {
+        return [inst.name, inst.properties, inst.sparkSubmitArgs, inst.versionConfigs, inst.distClasspathFilter];
+    }
+
+    constructor(readonly name: string, readonly properties: Record<string, string>,
+                readonly sparkSubmitArgs?: string, readonly versionConfigs?: VersionConfig[],
+                readonly distClasspathFilter?: string) {
         Object.freeze(this);
     }
 }
 
 export class NotebookConfig {
     static codec = combined(
-        optional(mapCodec(uint8, tinyStr, arrayCodec(uint8, tinyStr))),
+        optional(mapCodec(uint16, tinyStr, arrayCodec(uint16, tinyStr))),
         optional(arrayCodec(uint8, tinyStr)),
         optional(arrayCodec(uint8, RepositoryConfig.codec)),
         optional(mapCodec(uint16, str as Codec<string>, str)),

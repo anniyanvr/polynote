@@ -1,18 +1,9 @@
 package polynote.kernel.interpreter
 package python
-import java.io.{File, FileReader, PrintWriter, StringWriter}
-import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
-import java.util
-import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.{Executors, ThreadFactory}
-import cats.effect.concurrent.Ref
-import cats.syntax.traverse._
 import cats.syntax.either._
-import cats.instances.list._
+import io.circe._
 import io.circe.generic.semiauto._
 import io.circe.syntax._
-import io.circe._
 import io.circe.yaml.syntax._
 import jep.python.{PyCallable, PyObject}
 import jep.{Jep, JepConfig, JepException, NamingConventionClassEnquirer, SharedInterpreter}
@@ -22,15 +13,22 @@ import polynote.kernel.dependency.noCacheSentinel
 import polynote.kernel.environment.{Config, CurrentNotebook, CurrentRuntime, CurrentTask}
 import polynote.kernel.logging.Logging
 import polynote.kernel.task.TaskManager
-import polynote.kernel.{BaseEnv, CompileErrors, Completion, CompletionType, GlobalEnv, InterpreterEnv, KernelReport, ParameterHint, ParameterHints, ResultValue, ScalaCompiler, Signatures, TaskInfo}
-import polynote.messages.{CellID, Notebook, NotebookConfig, ShortString, TinyList, TinyString}
+import polynote.kernel.util.DepsParser.flattenDeps
+import polynote.kernel.{BaseEnv, CompileErrors, Completion, CompletionType, GlobalEnv, InterpreterEnv, KernelReport, ParameterHint, ParameterHints, ResultValue, ScalaCompiler, Signatures}
+import polynote.messages.{CellID, DefinitionLocation, Notebook, NotebookConfig, ShortString, TinyList, TinyString}
 import polynote.runtime.python.{PythonFunction, PythonObject, TypedPythonObject}
-import zio.internal.Executor
+import zio.ZIO.effect
 import zio.blocking.{Blocking, effectBlocking}
-import zio.duration._
+import zio.internal.Executor
 import zio.{Has, RIO, Runtime, Semaphore, Task, UIO, ZIO}
-import zio.interop.catz._
 
+import java.io.{FileReader, PrintWriter, StringWriter}
+import java.net.URI
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.util
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentSkipListSet, Executors, ThreadFactory}
 import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext
 import scala.reflect.{ClassTag, classTag}
@@ -47,6 +45,8 @@ class PythonInterpreter private[python] (
   venvPath: Option[Path]
 ) extends Interpreter {
   import pyApi._
+
+  private val allowedSources = new ConcurrentSkipListSet[String]()
 
   protected val runner: PythonObject.Runner = new PythonObject.Runner {
     def run[T](task: => T): T = if (Thread.currentThread() eq jepThread.get()) {
@@ -112,6 +112,10 @@ class PythonInterpreter private[python] (
       (_1, _2)
     }
 
+    override def as[T >: Null : ClassTag](obj: PythonObject): T = run {
+      obj.unwrap.as(classTag[T].runtimeClass.asInstanceOf[Class[T]])
+    }
+
     override def typeName(obj: PythonObject): String = run(pyApi.typeName(obj.unwrap))
     override def qualifiedTypeName(obj: PythonObject): String = run(pyApi.qualifiedTypeName(obj.unwrap))
     override def isCallable(obj: PyObject): Boolean = run(pyApi.isCallable(obj))
@@ -133,6 +137,21 @@ class PythonInterpreter private[python] (
     resState        <- run(compiled, decls, globals, state)
   } yield resState
 
+  private def extractParamsFast(jep: Jep, jediDefinition: PyObject): List[(String, String)] = {
+    val sigs = jediDefinition.getAttr("get_signatures", classOf[PyCallable])
+      .callAs(classOf[Array[PyObject]])
+
+    sigs.headOption.toList.flatMap {
+      sig => sig.getAttr("params", classOf[Array[PyObject]]).toList.map {
+        param =>
+          val str = param.getAttr("to_string", classOf[PyCallable]).callAs(classOf[String])
+          str.split(':').toList match {
+            case first :: rest => (first.trim, rest.mkString(":").trim)
+          }
+      }
+    }
+  }
+
   private def extractParams(jep: Jep, jediDefinition: PyObject): List[(String, String)] = {
     // TODO: this lambda is getting a bit unwieldy.
     val getParams = jep.getValue("lambda jediDef: list(map(lambda p: [p.name, next(iter(map(lambda t: t.name, p.infer())), None)], sum([s.params for s in jediDef.get_signatures()], [])))", classOf[PyCallable])
@@ -148,21 +167,18 @@ class PythonInterpreter private[python] (
     globals => jep {
       jep =>
         val jedi = jep.getValue("jedi.Interpreter", classOf[PyCallable])
-        val lines = code.substring(0, pos).split('\n')
-        val lineNo = lines.length
-        val col = lines.last.length
+        val (lineNo, col) = posToLineAndColumn(code, pos)
+        println(lineNo, col)
         val pyCompletions = jedi.callAs[PyObject](classOf[PyObject], code, Array(globals))
           .getAttr("complete", classOf[PyCallable])
           .callAs(classOf[Array[PyObject]], Integer.valueOf(lineNo), Integer.valueOf(col))
-
-        pyCompletions.map {
+        val result = pyCompletions.map {
           completion =>
             val name = completion.getAttr("name", classOf[String])
             val typ = completion.getAttr("type", classOf[String])
             // TODO: can we get better type completions?
             val params = typ match {
-              case "function" =>
-                List(TinyList(extractParams(jep, completion).map { case (a, b) => (TinyString(a), ShortString(b))}))
+              case "function" => List(TinyList(extractParamsFast(jep, completion).map { case (a, b) => (TinyString(a), ShortString(b))}))
               case _ => Nil
             }
             val completionType = typ match {
@@ -177,6 +193,7 @@ class PythonInterpreter private[python] (
             Completion(name, Nil, params, ShortString(""), completionType)
         }.toList
 
+        result
     }
   }
 
@@ -184,9 +201,7 @@ class PythonInterpreter private[python] (
     globals => jep {
       jep =>
         try {
-          val lines = code.substring(0, pos).split('\n')
-          val line = lines.length
-          val col = lines.last.length
+          val (line, col) = posToLineAndColumn(code, pos)
           val jedi = jep.getValue("jedi.Interpreter", classOf[PyCallable])
           val sig = jedi.callAs[PyObject](classOf[PyObject], code, Array(globals))
             .getAttr("get_signatures", classOf[PyCallable])
@@ -217,6 +232,51 @@ class PythonInterpreter private[python] (
             None
         }
     }
+  }
+
+  private def definitionLocations(script: PyObject, line: Int, col: Int) = jep { jep =>
+    val pyNames = script.getAttr("goto", classOf[PyCallable]) // see https://jedi.readthedocs.io/en/latest/docs/api.html#jedi.Script.goto
+      .callAs(
+        classOf[Array[PyObject]],
+        Array[Object](Integer.valueOf(line), Integer.valueOf(col)), // positional args
+        Map[String, Object]("follow_imports" -> Boolean.box(true), "follow_builtin_imports" -> Boolean.box(true)).asJava)
+    pyNames.toList.flatMap {
+      jediName =>
+        val path = jediName.getAttr("module_path", classOf[String])
+        val line = jediName.getAttr("line", classOf[Integer])
+        val column = jediName.getAttr("column", classOf[Integer])
+        if (path != null)
+          Some(DefinitionLocation(path, line, column))
+        else None
+    }
+  }.tap {
+    locs => ZIO(locs.foreach(loc => allowedSources.add(loc.uri)))
+  }
+
+  // TODO: we probably need to write out prior code cells, and use the jedi Project (https://jedi.readthedocs.io/en/latest/docs/api.html#jedi.Project)
+  //        to allow finding references to other cells. This will only find references that are external.
+  override def goToDefinition(code: String, pos: Int, state: State): RIO[Blocking with Logging, List[DefinitionLocation]] = {
+    for {
+      globals     <- populateGlobals(state)
+      (line, col)  = posToLineAndColumn(code, pos)
+      jedi        <- jep(_.getValue("jedi.Interpreter", classOf[PyCallable]).callAs(classOf[PyObject], code, Array(globals)))
+      locations   <- definitionLocations(jedi, line, col)
+    } yield locations
+  }.catchAllCause(cause => Logging.error(cause).as(Nil))
+
+  override def goToDependencyDefinition(uri: String, pos: Int): RIO[Blocking, List[DefinitionLocation]] = for {
+    path        <- effect(new URI(uri).getPath)
+    // need this just for line/column. Probably should have just used that for position so it could come from front-end
+    codeStr     <- readFile(Paths.get(path))
+    (line, col)  = posToLineAndColumn(codeStr, pos)
+    script      <- jep(_.getValue("jedi.Script", classOf[PyCallable]).callAs(classOf[PyObject], Map[String, Object]("path" -> path).asJava))
+    locations   <- definitionLocations(script, line, col)
+  } yield locations
+
+  override def getDependencyContent(uri: String): RIO[Blocking, String] = ZIO(new URI(uri)).flatMap {
+    // check that the file is a python file, *and* it's previously been sent to the client as a definition location
+    case uri if !uri.getPath.endsWith(".py") || !allowedSources.contains(uri.getPath) => ZIO.fail(new SecurityException(s""))
+    case uri => effectBlocking(Files.readAllLines(Paths.get(uri.getPath)).asScala.mkString("\n"))
   }
 
   def init(state: State): RIO[InterpreterEnv, State] = for {
@@ -781,6 +841,13 @@ class PythonInterpreter private[python] (
                   // filter `Out` values that are equal to `None` (this approximates a "void" return type for Python)
                   val notNoneOut = key != "Out" || (key == "Out" && typeStr != "NoneType")
 
+                  // unwrap a wrapped Java value
+                  def unwrapJavaValue = {
+                    val jValue = valueAs(classOf[Object])
+                    val typ = runtime.unsafeRun(compiler.reflect(jValue)).symbol.info
+                    (typ, jValue)
+                  }
+
                   if (typeStr != null && notNoneOut && typeStr != "module") {
                     val (typ, value) = typeStr match {
                       case "int" => (typeOf[Long], valueAs(classOf[java.lang.Number]).longValue())
@@ -792,19 +859,23 @@ class PythonInterpreter private[python] (
 
                       // TODO: can we get better type information from `PyJArray`?
                       // Types that start with "PyJ*" are actually Java values wrapped by jep for use in Python
-                      case other if other.startsWith("PyJ") =>
-                        val jValue = valueAs(classOf[Object])
-                        val typ = runtime.unsafeRun(compiler.reflect(jValue)).symbol.info
-                        (typ, jValue)
+                      case other if other.startsWith("PyJ") => unwrapJavaValue
                       case other =>
-                        val pyObj = valueAs(classOf[PyObject])
-                        if (convert.isDefinedAt((typeStr, pyObj))) {
-                          convert((typeStr, pyObj))
-                        } else {
-                          // should we use the qualified type? It's confusing that both Spark and Pandas have a "DataFrame".
-                          // But in every other case it's just noise.
-                          val typ = appliedType(typeOf[TypedPythonObject[Nothing]].typeConstructor, compiler.global.internal.constantType(Constant(other)))
-                          (typ, new TypedPythonObject[String](valueAs(classOf[PyObject]), runner))
+                        // TODO: is there any way to determine whether it's a wrapped Java value if it's not wrapped in PyJ*?
+                        try {
+                          val pyObj = valueAs(classOf[PyObject])
+                          if (convert.isDefinedAt((typeStr, pyObj))) {
+                            convert((typeStr, pyObj))
+                          } else {
+                            // should we use the qualified type? It's confusing that both Spark and Pandas have a "DataFrame".
+                            // But in every other case it's just noise.
+                            val typ = appliedType(typeOf[TypedPythonObject[Nothing]].typeConstructor, compiler.global.internal.constantType(Constant(other)))
+                            (typ, new TypedPythonObject[String](valueAs(classOf[PyObject]), runner))
+                          }
+                        } catch {
+                          case e: JepException if e.getMessage.contains("TypeError") =>
+                            // this might still be a Java value that for some reason isn't wrapped as a PyJ* object
+                            unwrapJavaValue
                         }
                     }
                     Some(new ResultValue(key, compiler.unsafeFormatType(typ.asInstanceOf[Type]), Nil, state.id, value, typ.asInstanceOf[Type], None))
@@ -828,6 +899,8 @@ class PythonInterpreter private[python] (
     err.setStackTrace(stackTraceElements)
     err
   }
+
+  override val fileExtensions: Set[String] = Set("py")
 
   protected def errorCause(get: PyCallable): Option[Throwable] =
     Option(get.callAs(classOf[PyObject], "cause")).flatMap {
@@ -1008,11 +1081,12 @@ object VirtualEnvFetcher {
     val notebookConfig = notebook.config.getOrElse(NotebookConfig.empty)
     val dependencies = notebookConfig.dependencies.toList.flatMap(_.getOrElse("python", Nil)).distinct
     val pipRepos = notebookConfig.repositories.toList.flatten.collect { case x: pip => x }
-    val pyConfig = PythonDepConfig(dependencies, pipRepos, notebookConfig.exclusions.toList.flatten)
     if (dependencies.nonEmpty) {
       for {
         dir         <- effectBlocking(Paths.get(sanitize(config.storage.cache), sanitize(notebook.path), "venv").toAbsolutePath)
         _           <- CurrentTask.update(_.progress(0.0, Some("Initializing virtual environment")))
+        txtDeps     <- flattenDeps(dependencies)
+        pyConfig     = PythonDepConfig(txtDeps, pipRepos, notebookConfig.exclusions.toList.flatten)
         initialized <- initVenv(dir, pyConfig)
         _           <- ZIO.when(initialized)(CurrentTask.update(_.progress(0.2, Some("Installing dependencies"))))
         _           <- ZIO.when(initialized)(installDependencies(dir, pyConfig))
@@ -1103,7 +1177,7 @@ object VirtualEnvFetcher {
               val parseConfig = effectBlocking(new FileReader(configFile)).bracketAuto {
                 reader =>
                   ZIO.fromEither {
-                    yaml.parser.parse(reader).flatMap(_.as[PythonDepConfig])
+                    yaml.Parser.default.parse(reader).flatMap(_.as[PythonDepConfig])
                   }
               }
 
@@ -1154,22 +1228,22 @@ object VirtualEnvFetcher {
           taskManager.runSubtask(s"Installing $dep") {
             // use semaphore to ensure only one `pip install` is happening at a time.
             val doInstall = installSemaphore.withPermit(for {
-              _ <- CurrentTask.access.flatMap(_.update(_.progress(0.1)))
-              _ <- parentTask.update(task => task.progress(task.progressFraction + depInitProgress, Some(s"Installing $dep")))
+              _ <- CurrentTask.update(_.progress(0.1))
+              _ <- parentTask.update(task => ZIO.succeed(task.progress(task.progressFraction + depInitProgress, Some(s"Installing $dep"))))
               _ <- pip("install", dep)
             } yield ())
 
             for {
               _ <- doInstall
-              _ <- CurrentTask.access.flatMap(_.update(_.progress(0.8).copy(label = s"Downloading $dep")))
-              _ <- parentTask.update(task => task.progress(task.progressFraction + depInstalledProgress))
+              _ <- CurrentTask.update(_.progress(0.8).copy(label = s"Downloading $dep"))
+              _ <- parentTask.update(task => ZIO.succeed(task.progress(task.progressFraction + depInstalledProgress)))
               _ <- pip("download", dep, List("--dest", s"$venv/deps/"))
-              _ <- CurrentTask.access.flatMap(_.update(_.progress(0.9)))
-              _ <- parentTask.update(task => task.progress(task.progressFraction + depDownloadedProgress))
+              _ <- CurrentTask.update(_.progress(0.9))
+              _ <- parentTask.update(task => ZIO.succeed(task.progress(task.progressFraction + depDownloadedProgress)))
             } yield ()
           }
       }
-      _ <- parentTask.update(task => task.progress(0.9, Some("finishing...")))
+      _ <- parentTask.update(task => ZIO.succeed(task.progress(0.9, Some("finishing..."))))
     } yield ()
   }
 

@@ -4,10 +4,25 @@ from pathlib import Path
 import os
 import shlex
 
-if not os.environ.get('PYTHONPATH'):
-    os.environ['PYTHONPATH'] = sys.prefix
+# Depending on how Python is installed, sometimes it's hard to find jep or other important libraries (e.g., libpython). 
+# The sys module contains a bunch of *_prefix attributes that point to various locations where these libraries might be, 
+# such as https://docs.python.org/3/library/sys.html#sys.exec_prefix 
+# We set both the PYTHONPATH and the LD_LIBRARY_PATH just in case
 
-scala_version = os.environ.get('POLYNOTE_SCALA_VERSION', '2.11')
+is_valid_prefix = lambda name: "prefix" in name and name != "pycache_prefix"
+sys_prefixes = {getattr(sys, sys_prefix) for sys_prefix in filter(is_valid_prefix, dir(sys))}
+
+if not os.environ.get('PYTHONPATH'):
+    os.environ['PYTHONPATH'] = os.pathsep.join(sys_prefixes)
+else: 
+    print("Using user-provided PYTHONPATH")
+    
+if not os.environ.get('LD_LIBRARY_PATH'):
+    os.environ['LD_LIBRARY_PATH'] = os.pathsep.join([os.path.join(path, "lib") for path in sys_prefixes])
+else: 
+    print("Using user-provided LD_LIBRARY_PATH")
+
+scala_version = os.environ.get('POLYNOTE_SCALA_VERSION', '2.12')
 
 polynote_dir = os.path.dirname(os.path.realpath(__file__))
 os.chdir(polynote_dir)
@@ -33,7 +48,8 @@ if not(deps_path.exists()):
 
 deps = Path(polynote_dir).joinpath("deps", scala_version).glob("*.jar")
 classpath = ":".join([":".join([ f'"{d}"' for d in deps ]), ":".join([ f'"{p}"' for p in plugins ])])
-cmd = f"java -cp {classpath} -Djava.library.path={jep_path} polynote.Main {' '.join(sys.argv[1:])}"
+java_executable = os.path.join(os.environ['JAVA_HOME'], 'bin', 'java') if os.environ.get('JAVA_HOME') else 'java'
+cmd = f"{java_executable} -cp {classpath} -Djava.library.path={jep_path} polynote.Main {' '.join(sys.argv[1:])}"
 cmd = shlex.split(cmd)
 print(cmd)
 os.execvp(cmd[0], cmd)

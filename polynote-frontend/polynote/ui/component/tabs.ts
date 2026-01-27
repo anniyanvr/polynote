@@ -6,6 +6,8 @@ import {ServerStateHandler} from "../../state/server_state";
 import {Notebook} from "./notebook/notebook";
 import {VimStatus} from "./notebook/vim_status";
 import {nameFromPath} from "../../util/helpers";
+import {DependencyViewer} from "./notebook/dependency_viewer";
+import {matchS} from "../../util/match";
 
 export class Tabs extends Disposable {
     readonly el: TagElement<"div">;
@@ -22,14 +24,28 @@ export class Tabs extends Disposable {
 
         this.addHome()
 
-        ServerStateHandler.get.observeKey("openNotebooks", nbs => {
-            if (nbs.length > 0) {
-                nbs.forEach(path => {
-                    if (this.getTab(path) === undefined && path !== "home") {
-                        const nbInfo = ServerStateHandler.getOrCreateNotebook(path);
-                        if (nbInfo?.info) {
-                            this.add(path, this.mkTitle(path), new Notebook(nbInfo.info.dispatcher, nbInfo.handler).el);
-                        }
+        ServerStateHandler.get.observeKey("openFiles", ofs => {
+            if (ofs.length > 0) {
+                ofs.forEach(of => {
+                    const path = of.path;
+                    if (this.getTab(path) === undefined) {
+                        const newTabEl: TagElement<any> | undefined = matchS(of.type)
+                            .when("notebook", () => {
+                                const nbInfo = ServerStateHandler.getOrCreateNotebook(path);
+                                return nbInfo?.info ? new Notebook(nbInfo.info.dispatcher, nbInfo.handler).el : undefined
+                            })
+                            .when("dependency_source", () => {
+                                const depSrc = ServerStateHandler.state.dependencySources[path];
+                                return !depSrc ? undefined : new DependencyViewer(
+                                    path,
+                                    depSrc.content,
+                                    depSrc.language,
+                                    depSrc.position,
+                                    depSrc.sourceNotebook).el
+                            }).otherwise(undefined);
+                        const title: TagElement<"span"> = of.type == "dependency_source" ? this.mkDependencyTitle(path)
+                                                                                         : this.mkTitle(path)
+                        this.add(path, title, newTabEl);
                     }
                 })
             } else {
@@ -94,7 +110,7 @@ export class Tabs extends Disposable {
                     this.tabContainer.replaceChild(newTab, tab.tab)
                     this.tabs[newPath] = {...tab, tab: newTab};
                     if (this.currentTab?.path === oldPath) {
-                        this.activate(newPath)
+                        this.activate(newPath, true); // should not update currentNotebook yet, other state changes not completed
                     }
                 }
             ).disposeWith(this);
@@ -103,7 +119,7 @@ export class Tabs extends Disposable {
         }
     }
 
-    activate(path: string) {
+    activate(path: string, skipSelectingFile?: boolean) {
         if (this.currentTab === undefined || this.currentTab.tab.classList.contains("active")) {
             const tab = this.tabs[path];
             const current = this.currentTab;
@@ -115,7 +131,9 @@ export class Tabs extends Disposable {
             }
             tab.tab.classList.add("active");
             this.currentTab = {path, tab: tab.tab, content: tab.content};
-            ServerStateHandler.selectNotebook(path)
+            if (!skipSelectingFile) {
+                ServerStateHandler.selectFile(path);
+            }
         }
     }
 
@@ -131,7 +149,7 @@ export class Tabs extends Disposable {
             delete this.tabs[path];
 
             if (path !== "home") {
-                ServerStateHandler.closeNotebook(path)
+                ServerStateHandler.closeFile(path)
             }
 
             if (this.currentTab?.path === path) {
@@ -152,5 +170,11 @@ export class Tabs extends Disposable {
 
     private mkTitle(path: string): TagElement<"span"> {
        return span(['notebook-tab-title'], [nameFromPath(path)]);
+    }
+
+    private mkDependencyTitle(uri: string): TagElement<"span"> {
+        const dep = new URLSearchParams(new URL(uri).search).get("dependency") || "";
+        const pathParts = dep.split('/');
+        return span(['notebook-tab-title', 'dependency-source-tab-title'], [pathParts[pathParts.length - 1]]).attr('title', dep);
     }
 }

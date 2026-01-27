@@ -1,5 +1,13 @@
 import * as messages from "../data/messages";
-import {HandleData, ModifyStream, NotebookUpdate, NotebookVersion, ReleaseHandle, TableOp} from "../data/messages";
+import {
+    HandleData,
+    ModifyStream,
+    NotebookUpdate,
+    NotebookVersion,
+    ReleaseHandle,
+    NotebookSaved,
+    TableOp
+} from "../data/messages";
 import {
     ClientResult,
     Output,
@@ -74,6 +82,14 @@ export class NotebookMessageDispatcher extends MessageDispatcher<NotebookState, 
         this.handler.observeKey("activeCompletion", sig => {
             if (sig) {
                 this.socket.send(new messages.CompletionsAt(sig.cellId, sig.offset, []))
+            }
+        })
+
+        let nextReqId = 0;
+
+        this.handler.observeKey("requestedDefinition", req => {
+            if (req) {
+                this.socket.send(new messages.GoToDefinitionRequest(req.cellOrFile, req.offset, nextReqId++));
             }
         })
 
@@ -269,6 +285,18 @@ export class NotebookMessageDispatcher extends MessageDispatcher<NotebookState, 
         }
     }
 
+    runFromActiveCell() {
+        const state = this.handler.state;
+        const id = state.activeCellId;
+        if (id !== undefined) {
+            const activeIdx = state.cellOrder.indexOf(id)
+            const cellsToRun = state.cellOrder.slice(activeIdx);
+            if (cellsToRun.length > 0) {
+                this.runCells(cellsToRun)
+            }
+        }
+    }
+
     /*******************************
      ** Data streaming methods **
      *******************************/
@@ -348,7 +376,7 @@ export class ServerMessageDispatcher extends MessageDispatcher<ServerState>{
                         disposable.dispose()
                         ServerStateHandler.loadNotebook(newNb, true).then(nbInfo => {
                             nbInfo.handler.updateField("config", () => setProperty("open", true))
-                            ServerStateHandler.selectNotebook(newNb)
+                            ServerStateHandler.selectFile(newNb)
                         })
                     }
                 })
@@ -358,9 +386,9 @@ export class ServerMessageDispatcher extends MessageDispatcher<ServerState>{
             this.socket.send(new messages.CreateNotebook(path, content))
             waitForNotebook(path)
         } else {
-            new DialogModal('Create Notebook', (path ?? 'path/to/notebook') + "/", 'Create').show().then(newPath => {
-                this.socket.send(new messages.CreateNotebook(newPath, content))
-                waitForNotebook(newPath)
+            new DialogModal('Create Notebook', (path ?? 'path/to/notebook') + "/", 'Create').show().then(newNbInfo => {
+                this.socket.send(new messages.CreateNotebook(newNbInfo.path, content, newNbInfo.template))
+                waitForNotebook(newNbInfo.path)
             })
         }
     }
@@ -369,8 +397,8 @@ export class ServerMessageDispatcher extends MessageDispatcher<ServerState>{
         if (newPath) {
             this.socket.send(new messages.RenameNotebook(oldPath, newPath))
         } else {
-            new DialogModal('Rename Notebook', oldPath, 'Rename').show().then(newPath => {
-                this.socket.send(new messages.RenameNotebook(oldPath, newPath))
+            new DialogModal('Rename Notebook', oldPath, 'Rename').show().then(newNbInfo => {
+                this.socket.send(new messages.RenameNotebook(oldPath, newNbInfo.path))
             })
         }
     }
@@ -379,8 +407,8 @@ export class ServerMessageDispatcher extends MessageDispatcher<ServerState>{
         if (newPath) {
             this.socket.send(new messages.CopyNotebook(oldPath, newPath))
         } else {
-            new DialogModal('Copy Notebook', oldPath, 'Copy').show().then(newPath => {
-                this.socket.send(new messages.CopyNotebook(oldPath, newPath))
+            new DialogModal('Copy Notebook', oldPath, 'Copy').show().then(newNbInfo => {
+                this.socket.send(new messages.CopyNotebook(oldPath, newNbInfo.path))
             })
         }
     }
@@ -389,6 +417,10 @@ export class ServerMessageDispatcher extends MessageDispatcher<ServerState>{
         if (confirm(`Permanently delete ${path}?`)) {
             this.socket.send(new messages.DeleteNotebook(path))
         }
+    }
+
+    searchNotebooks(query: string) {
+        this.socket.send(new messages.SearchNotebooks(query, []));
     }
 
     /*******************************

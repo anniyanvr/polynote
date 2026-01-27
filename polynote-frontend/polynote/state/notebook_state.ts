@@ -19,7 +19,7 @@ import {ClientResult, CompileErrors, Output, PosRange, ResultValue, RuntimeError
 
 import * as messages from "../data/messages";
 import {
-    CompletionCandidate,
+    CompletionCandidate, GoToDefinitionResponse,
     HandleData,
     KernelStatusString,
     ModifyStream,
@@ -36,6 +36,9 @@ import {deepEquals, Deferred} from "../util/helpers";
 import {notReceiver} from "../messaging/receiver";
 import {ConstView, ProxyStateView} from "./state_handler";
 import {ServerStateHandler} from "./server_state";
+import {IPosition, languages} from "monaco-editor";
+import Definition = languages.Definition;
+import {Either, Left, Right} from "../data/codec_types";
 
 
 export type CellPresenceState = {id: number, name: string, color: string, range: PosRange, avatar?: string};
@@ -62,7 +65,15 @@ export interface CellState {
 
 export type CompletionHint = { cell: number, offset: number; completions: CompletionCandidate[] }
 export type SignatureHint = { cell: number, offset: number, signatures?: Signatures };
-export type NBConfig = {open: boolean, config: NotebookConfig}
+export type NBConfig = {
+    open: boolean,
+    openDependencies: boolean,
+    openResolvers: boolean,
+    openExclusions: boolean,
+    openSpark: boolean,
+    openKernel: boolean,
+    config: NotebookConfig
+}
 
 export type KernelSymbols = Record<string, Record<string, ResultValue>>;
 export type KernelInfo = Record<string, string>;
@@ -86,8 +97,10 @@ export interface NotebookState {
     kernel: KernelState,
     // ephemeral states
     activeCellId: number | undefined,
-    activeCompletion: { cellId: number, offset: number, resolve: (completion: CompletionHint) => void, reject: () => void } | undefined,
-    activeSignature: { cellId: number, offset: number, resolve: (signature: SignatureHint) => void, reject: () => void } | undefined,
+    requestedCellPosition: [number, IPosition] | undefined,
+    activeCompletion: { cellId: number, offset: number, resolve: (completion: CompletionHint) => void, reject: (reason?: any) => void } | undefined,
+    activeSignature: { cellId: number, offset: number, resolve: (signature: SignatureHint) => void, reject: (reason?: any) => void } | undefined,
+    requestedDefinition: { cellOrFile: Left<string> | Right<number>, offset: number, resolve: (definition: GoToDefinitionResponse) => void, reject: (reason?: any) => void } | undefined,
     activePresence: Record<number, PresenceState>,
     // map of handle ID to message received.
     activeStreams: Record<number, (HandleData | ModifyStream)[]>,
@@ -160,7 +173,15 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
             path,
             cells: {},
             cellOrder: [],
-            config: {open: false, config: NotebookConfig.default},
+            config: {
+                open: false,
+                openDependencies: true,
+                openResolvers: true,
+                openExclusions: true,
+                openSpark: true,
+                openKernel: true,
+                config: NotebookConfig.default
+            },
             kernel: {
                 symbols: {},
                 status: 'disconnected',
@@ -169,8 +190,10 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
             },
             activePresence: {},
             activeCellId: undefined,
+            requestedCellPosition: undefined,
             activeCompletion: undefined,
             activeSignature: undefined,
+            requestedDefinition: undefined,
             activeStreams: {},
         });
 
@@ -260,6 +283,12 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
         return id
     }
 
+    selectCellAt(cell: number, position: IPosition) {
+        this.selectCell(cell);
+        const value: [number, IPosition] = [cell, position];
+        this.updateField("requestedCellPosition", () => value)
+    }
+
     /**
      * Helper for inserting a cell.
      *
@@ -267,6 +296,8 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
      * @param anchor     The anchor. If it is undefined, the anchor is based on the currently selected cell. If none is
      *                   selected, the anchor is either the first or last cell (depending on the direction supplied).
      *                   The anchor is used to determine the location, language, and metadata to supply to the new cell.
+     *                   If an anchor is not explicitly defined, the new cell's metadata will not contain the old cell's
+     *                   execution info.
      * @return           A Promise that resolves with the inserted cell's id.
      */
     insertCell(direction: 'above' | 'below', anchor?: {id: number, language: string, metadata: CellMetadata, content?: string}): Promise<number> {
@@ -281,7 +312,11 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
                 }
             }
             const currentCell = state.cells[currentCellId];
-            anchor = {id: currentCellId, language: (currentCell?.language === undefined || currentCell?.language === 'viz') ? 'scala' : currentCell.language, metadata: currentCell?.metadata ?? new CellMetadata()};
+            // Shed old execution info
+            const newCellMetadata = currentCell ?
+                new CellMetadata(currentCell.metadata.disableRun, currentCell.metadata.hideSource, currentCell.metadata.hideOutput, currentCell.metadata.splitDisplay, currentCell.metadata.wrapOutput) :
+                new CellMetadata();
+            anchor = {id: currentCellId, language: (currentCell?.language === undefined || currentCell?.language === 'viz') ? 'scala' : currentCell.language, metadata: newCellMetadata};
         }
         const anchorIdx = this.getCellIndex(anchor.id)!;
         const prevIdx = direction === 'above' ? anchorIdx - 1 : anchorIdx;
@@ -305,7 +340,7 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
         this.insertCell("below", {
             id: result.sourceCell,
             language: 'viz',
-            metadata: new CellMetadata(false, false, false),
+            metadata: new CellMetadata(false, false, false, false, false),
             content: JSON.stringify({type: viewType, value: result.name})
         }).then(id => this.selectCell(id))
     }
@@ -341,7 +376,7 @@ export class NotebookStateHandler extends BaseHandler<NotebookState> {
         const cell = this.cellsHandler.state[id];
         this.cellsHandler.updateField(id, () => ({
             language,
-            // clear a bunch of stuff if we're changing to text... hm, maybe we need to do something else when it's a a text cell...
+            // clear a bunch of stuff if we're changing to text... hm, maybe we need to do something else when it's a text cell...
             output: language === "text" ? clearArray() : NoUpdate,
             results: language === "text" ? clearArray() : NoUpdate,
             error: language === "text" ? false : NoUpdate,
@@ -499,12 +534,10 @@ export class NotebookUpdateHandler extends Disposable { // extends ObjectStateHa
     rebaseUpdate(update: NotebookUpdate) {
         this.globalVersion = update.globalVersion
         if (update.localVersion < this.localVersion) {
-            const prevUpdates = this.edits.range(update.localVersion, this.localVersion);
+            update = this.edits.rebaseThrough(update, this.localVersion);
 
             // discard edits before the local version from server – it will handle rebasing at least until that point
             this.edits = this.edits.discard(update.localVersion)
-
-            update = messages.NotebookUpdate.rebase(update, prevUpdates)
         }
 
         return update

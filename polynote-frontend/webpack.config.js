@@ -3,6 +3,7 @@ const CopyWebpackPlugin = require('copy-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const webpack = require('webpack');
 const path = require('path');
+const {exec} = require("child_process");
 
 module.exports = {
   entry: './polynote/main.ts',
@@ -10,7 +11,8 @@ module.exports = {
   output: {
     path: path.resolve(__dirname, 'dist/static'),
     filename: 'app.[contenthash].js',
-    publicPath: 'static/'
+    publicPath: 'static/',
+    hashFunction: 'xxhash64'
   },
   module: {
     rules: [{
@@ -49,7 +51,22 @@ module.exports = {
         { from: 'favicon.ico', to: 'favicon.ico' },
         { from: 'favicon.svg', to: 'favicon.svg' },
       ]
-    })
+    }),
+    {
+      apply: (compiler) => {
+        compiler.hooks.watchRun.tap('HtmlWebpackPlugin', (compilation) => {
+          if (compilation.modifiedFiles) {
+            let changedFiles = Array.from(compilation.modifiedFiles);
+            if (changedFiles.some(path => path.includes(".less"))) {
+              exec('./build_style', (err, stdout, stderr) => {
+                if (stdout) process.stdout.write(stdout);
+                if (stderr) process.stderr.write(stderr);
+              });
+            }
+          }
+        });
+      }
+    }
   ],
   mode: "development"
 };

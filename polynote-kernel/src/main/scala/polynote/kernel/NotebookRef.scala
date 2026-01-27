@@ -1,5 +1,6 @@
 package polynote.kernel
 
+import polynote.kernel.environment.BroadcastAll
 import polynote.messages.{CellID, Notebook, NotebookUpdate}
 import zio.stream.ZStream
 import zio.{IO, RIO, Task, UIO, ZIO}
@@ -49,7 +50,7 @@ trait NotebookRef {
     */
   def clearAllResults(): IO[NotebookRef.AlreadyClosed, List[CellID]]
 
-  def rename(newPath: String): RIO[BaseEnv with GlobalEnv, String]
+  def rename(newPath: String): RIO[BaseEnv with GlobalEnv with BroadcastAll, String]
 
   /**
     * Close the notebook.
@@ -67,7 +68,7 @@ trait NotebookRef {
     * Get a stream of notebook updates
     * @return
     */
-  def updates: ZStream[Any, Nothing, NotebookUpdate]
+  def updates: ZStream[Any, Throwable, NotebookUpdate]
 }
 
 

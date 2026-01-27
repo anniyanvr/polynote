@@ -4,15 +4,11 @@ import java.nio.file.{FileSystems, Files}
 import java.util.concurrent.{Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
-import cats.effect.concurrent.Ref
-import cats.instances.list._
-import cats.syntax.traverse._
-import fs2.concurrent.SignallingRef
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.SparkSession
 import polynote.buildinfo.BuildInfo
-import polynote.config.{PolynoteConfig, SparkConfig}
-import polynote.kernel.dependency.CoursierFetcher
+import polynote.config.{PolynoteConfig, ScalaVersionConfig, SparkConfig}
+import polynote.kernel.dependency.{Artifact, CoursierFetcher}
 import polynote.kernel.environment.{Config, CurrentNotebook, CurrentTask, Env}
 import polynote.kernel.interpreter.scal.{ScalaInterpreter, ScalaSparkInterpreter}
 import polynote.kernel.interpreter.{Interpreter, InterpreterState, State}
@@ -24,8 +20,9 @@ import polynote.runtime.spark.reprs.SparkReprsOf
 import zio.blocking.{Blocking, effectBlocking}
 import zio.clock.Clock
 import zio.internal.Executor
-import zio.{Promise, RIO, Task, ZIO, ZLayer}
-import zio.interop.catz._
+import zio.{Promise, RIO, Task, URIO, ZIO, ZLayer}
+import zio.system.System
+import zio.stream.SubscriptionRef
 import zio.system.{env, property}
 
 import scala.collection.JavaConverters._
@@ -41,7 +38,7 @@ class LocalSparkKernel private[kernel] (
   sparkSession: SparkSession,
   interpreterState: InterpreterState.Service,
   interpreters: RefMap[String, Interpreter],
-  busyState: SignallingRef[Task, KernelBusyState],
+  busyState: SubscriptionRef[KernelBusyState],
   closed: Promise[Throwable, Unit]
 ) extends LocalKernel(compilerProvider, interpreterState, interpreters, busyState, closed) {
 
@@ -61,7 +58,7 @@ class LocalSparkKernel private[kernel] (
 class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
 
   // all the JARs in Spark's classpath. I don't think this is actually needed.
-  private def sparkDistClasspath = env("SPARK_DIST_CLASSPATH").orDie.get.flatMap {
+  private def sparkDistClasspath: URIO[Blocking with Config with System, List[File]] = env("SPARK_DIST_CLASSPATH").orDie.get.flatMap {
     cp =>
       Config.access.flatMap {
         config =>
@@ -71,7 +68,7 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
             case Some(pattern) => requiredFilter.or(pattern.asPredicate())
           }
 
-          cp.split(File.pathSeparator).toList.map {
+          ZIO.foreach(cp.split(File.pathSeparator).toList) {
             filepath =>
               val file = new File(filepath)
               file.getName match {
@@ -85,7 +82,7 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
                 case _ =>
                   effectBlocking(if (file.exists()) List(file) else Nil).orDie
               }
-          }.sequence.map(_.flatten).map {
+          }.map(_.flatten).map {
             expandedFiles =>
               expandedFiles.filter {
                 path =>
@@ -97,22 +94,23 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
       }
   }.orElseSucceed(Nil)
 
-  private def sparkClasspath = env("SPARK_HOME").orDie.get.flatMap {
-    sparkHome =>
-      for {
-        fromSparkDist <- sparkDistClasspath
-        _             <- ZIO.when(fromSparkDist.nonEmpty)(Logging.info(s"Adding these paths from SPARK_DIST_CLASSPATH: $fromSparkDist"))
-        fromSparkJars <- effectBlocking {
-          val homeFile = new File(sparkHome)
-          if (homeFile.exists()) {
-            val jarsPath = homeFile.toPath.resolve("jars")
-            Files.newDirectoryStream(jarsPath, "*.jar").iterator().asScala.toList.map(_.toFile)
-          } else Nil
-        }.orDie
-      } yield (fromSparkDist ++ fromSparkJars).distinct
-  }
+  private def sparkClasspath: ZIO[Blocking with Logging with Config with System, Option[Nothing], List[File]] =
+    env("SPARK_HOME").orDie.get.flatMap {
+      sparkHome =>
+        for {
+          fromSparkDist <- sparkDistClasspath
+          _             <- ZIO.when(fromSparkDist.nonEmpty)(Logging.info(s"Adding these paths from SPARK_DIST_CLASSPATH: $fromSparkDist"))
+          fromSparkJars <- effectBlocking {
+            val homeFile = new File(sparkHome)
+            if (homeFile.exists()) {
+              val jarsPath = homeFile.toPath.resolve("jars")
+              Files.newDirectoryStream(jarsPath, "*.jar").iterator().asScala.toList.map(_.toFile)
+            } else Nil
+          }.orDie
+        } yield (fromSparkDist ++ fromSparkJars).distinct
+    }
 
-  private def systemClasspath =
+  private def systemClasspath: ZIO[System, Option[Nothing], List[File]] =
     property("java.class.path").orDie.get
       .map(_.split(File.pathSeparator).toList.map(new File(_)))
 
@@ -121,19 +119,82 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
     settings
   }
 
+  private def detectScalaBinaryVersion: URIO[Config with CurrentNotebook, String] = {
+    CurrentNotebook.config.flatMap { notebookConfig =>
+      notebookConfig.scalaVersion match {
+        case Some(scalaVer) => ZIO.succeed(scalaVer.split('.').take(2).mkString("."))
+        case None => Config.access.map { serverConfig =>
+          serverConfig.kernel.scalaVersion.map(_.split('.').take(2).mkString(".")).getOrElse("2.12")
+        }
+      }
+    }
+  }
+
+  /**
+   * Selects the appropriate Spark runtime JAR based on configuration.
+   *
+   * Logic:
+   * 1. If notebook has a selected template, look up its version_configs and extract spark_version
+   * 2. Default: Falls back to DEFAULT_SPARK_VERSION if notebook has no template or version_configs not found
+   *
+   * Example configuration:
+   * spark:
+   *   property_sets:
+   *     - name: BDP / Spark 3.5
+   *       properties:
+   *         spark.driver.memory: 4g
+   *       version_configs:
+   *         - version_number: "2.12"
+   *           spark_version: "3.5"  # Determines which runtime JAR to load
+   */
+  private def selectSparkRuntimeJar(
+    scalaBinaryVersion: String,
+    config: PolynoteConfig,
+    nbConfig: NotebookConfig
+  ): URIO[Logging, File] = {
+    // Get Spark version from version_configs, defaults to DEFAULT_SPARK_VERSION
+    val sparkVersion = {
+      val versionConfigSparkVersion = for {
+        sparkConfig <- config.spark
+        propertySets <- sparkConfig.propertySets
+        selectedSetName <- nbConfig.sparkTemplate.map(_.name)
+        selectedSet <- propertySets.find(_.name == selectedSetName)
+        versionConfigs <- selectedSet.versionConfigs
+        // Each property set has one version_configs field containing a list of configs for different Scala versions.
+        // All entries in the list should have the same spark_version, so just take the first.
+        firstVersionConfig <- versionConfigs.headOption
+      } yield firstVersionConfig.sparkVersion
+
+      versionConfigSparkVersion.getOrElse(ScalaVersionConfig.DEFAULT_SPARK_VERSION)
+    }
+
+    val versionSpecificJar = new File(s"deps/${scalaBinaryVersion}/spark-${sparkVersion}/polynote-spark-runtime.jar")
+
+    if (versionSpecificJar.exists()) {
+      Logging.info(s"Using Spark ${sparkVersion} runtime JAR for Scala ${scalaBinaryVersion}: ${versionSpecificJar.getPath}") *>
+        ZIO.succeed(versionSpecificJar)
+    } else {
+      // Fallback to classpath JAR (for development/single-version deployments)
+      Logging.warn(s"Version-specific JAR not found at ${versionSpecificJar.getPath}, using classpath JAR") *>
+        ZIO.succeed(new File(pathOf(classOf[SparkReprsOf[_]]).getPath))
+    }
+  }
+
   def apply(): RIO[BaseEnv with GlobalEnv with CellEnv, Kernel] = for {
+    config           <- Config.access
+    nbConfig         <- CurrentNotebook.config
     scalaDeps        <- CoursierFetcher.fetch("scala")
-    (main, transitive) = scalaDeps.partition(_._1)
-    sparkRuntimeJar   = new File(pathOf(classOf[SparkReprsOf[_]]).getPath)
+    scalaBinaryVer   <- detectScalaBinaryVersion
+    sparkRuntimeJar  <- selectSparkRuntimeJar(scalaBinaryVer, config, nbConfig)
     sparkClasspath   <- (sparkClasspath orElse systemClasspath).option.map(_.getOrElse(Nil))
     _                <- Logging.info(s"Using spark classpath: ${sparkClasspath.mkString(":")}")
-    sparkJars         = (sparkRuntimeJar :: ScalaCompiler.requiredPolynotePaths).map(f => f.toString -> f) ::: scalaDeps.map { case (_, uri, file) => (uri, file) }
-    compiler         <- ScalaCompiler(main.map(_._3), sparkRuntimeJar :: transitive.map(_._3), sparkClasspath, updateSettings)
+    sparkJars         = (sparkRuntimeJar :: ScalaCompiler.requiredPolynotePaths).map(f => f.toString -> f) ::: scalaDeps.map {a => (a.url, a.file) }
+    compiler         <- ScalaCompiler(Artifact(false, sparkRuntimeJar.toURI.toString, sparkRuntimeJar, None) :: scalaDeps, sparkClasspath, updateSettings _)
     classLoader       = compiler.classLoader
     session          <- startSparkSession(sparkJars, classLoader)
-    busyState        <- SignallingRef[Task, KernelBusyState](KernelBusyState(busy = true, alive = true))
+    busyState        <- SubscriptionRef.make(KernelBusyState(busy = true, alive = true))
     interpreters     <- RefMap.empty[String, Interpreter]
-    scalaInterpreter <- interpreters.getOrCreate("scala")(ScalaSparkInterpreter().provideSomeLayer[Blocking](ZLayer.succeed(compiler)))
+    scalaInterpreter <- interpreters.getOrCreate("scala")(ScalaSparkInterpreter().provideSomeLayer[BaseEnv with Config with TaskManager](ZLayer.succeed(compiler)))
     interpState      <- InterpreterState.access
     closed           <- Promise.make[Throwable, Unit]
   } yield new LocalSparkKernel(compiler, session, interpState, interpreters, busyState, closed)
@@ -199,7 +260,7 @@ class LocalSparkKernelFactory extends Kernel.Factory.LocalService {
         ZIO(session.sparkContext.addJar(jar))
           .catchAll(Logging.error(s"Unable to add dependency $jar to spark", _))
 
-      existingJars.diff(jars).toList.map(addJar).sequence.unit
+      ZIO.foreach_(existingJars.diff(jars))(addJar)
     }
 
     def attachListener(session: SparkSession): RIO[BaseEnv with TaskManager, Unit] = for {

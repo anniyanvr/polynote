@@ -2,9 +2,6 @@ package polynote.kernel
 
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
-import cats.instances.list._
-import cats.syntax.traverse._
-import fs2.concurrent.SignallingRef
 import polynote.kernel.Kernel.InterpreterNotStarted
 import polynote.kernel.dependency.CoursierFetcher
 import polynote.kernel.environment._
@@ -14,13 +11,13 @@ import polynote.kernel.interpreter.{CellExecutor, Interpreter, InterpreterState,
 import polynote.kernel.logging.Logging
 import polynote.kernel.task.TaskManager
 import polynote.kernel.util.RefMap
-import polynote.messages.{ByteVector32, CellID, HandleType, Lazy, NotebookCell, Streaming, TinyString, Updating, truncateTinyString}
+import polynote.messages.{ByteVector32, CellID, DefinitionLocation, HandleType, Lazy, NotebookCell, ShortString, Streaming, TinyString, Updating, truncateTinyString}
 import polynote.runtime._
 import scodec.bits.ByteVector
 import zio.blocking.{Blocking, effectBlocking}
 import zio.clock.Clock
 import zio.duration.Duration
-import zio.interop.catz._
+import zio.stream.SubscriptionRef
 import zio.{Promise, RIO, Task, UIO, URIO, ZIO, ZLayer}
 
 
@@ -28,7 +25,7 @@ class LocalKernel private[kernel] (
   scalaCompiler: ScalaCompiler,
   interpreterState: InterpreterState.Service,
   interpreters: RefMap[String, Interpreter],
-  busyState: SignallingRef[Task, KernelBusyState],
+  busyState: SubscriptionRef[KernelBusyState],
   closed: Promise[Throwable, Unit]
 ) extends Kernel {
 
@@ -36,8 +33,8 @@ class LocalKernel private[kernel] (
 
   override def queueCell(id: CellID): RIO[BaseEnv with GlobalEnv with CellEnv, Task[Unit]] = PublishStatus.access.flatMap {
     publishStatus =>
-      val notifyCancelled = publishStatus.publish1(CellStatusUpdate(id, Complete)).orDie
-      val notifyErrored   = publishStatus.publish1(CellStatusUpdate(id, ErrorStatus)).orDie
+      val notifyCancelled = publishStatus.publish(CellStatusUpdate(id, Complete))
+      val notifyErrored   = publishStatus.publish(CellStatusUpdate(id, ErrorStatus))
       val queueTask: RIO[BaseEnv with GlobalEnv with CellEnv, Task[Unit]] = TaskManager.queue(s"Cell $id", s"Cell $id", errorWith = _ => _.completed) {
         currentTime.flatMap {
           startTime =>
@@ -45,7 +42,7 @@ class LocalKernel private[kernel] (
               currentTime.flatMap(endTime => PublishResult(ExecutionInfo(startTime, Some(endTime))))
 
             val run = for {
-              _             <- busyState.update(_.setBusy)
+              _             <- busyState.ref.update(s => ZIO.succeed(s.setBusy))
               _             <- PublishStatus(CellStatusUpdate(id, Running))
               notebook      <- CurrentNotebook.get
               cell          <- ZIO(notebook.cell(id))
@@ -60,23 +57,23 @@ class LocalKernel private[kernel] (
               resultState   <- (interpreter.run(cell.content.toString, initialState).provideSomeLayer(CellExecutor.layer(scalaCompiler.classLoader)) >>= updateValues)
                 .ensuring(CurrentRuntime.access.flatMap(rt => ZIO.effectTotal(rt.clearExecutionStatus())))
               _             <- updateState(resultState)
-              _             <- resultState.values.map(PublishResult.apply).sequence.unit                                  // publish the result values
+              _             <- ZIO.collectAll_(resultState.values.map(PublishResult.apply))                              // publish the result values
               _             <- publishEndTime
               _             <- notifyCancelled
               notebook      <- CurrentNotebook.get
-              _             <- busyState.update(_.setIdle)
+              _             <- busyState.ref.update(s => ZIO.succeed(s.setIdle))
             } yield ()
 
             run.provideSomeLayer(CurrentRuntime.layer(id)).onInterrupt {
               PublishResult(ErrorResult(new InterruptedException("Execution was interrupted by the user"))).orDie *>
               notifyErrored *>
-              busyState.update(_.setIdle).orDie *>
+              busyState.ref.update(s => ZIO.succeed(s.setIdle)) *>
               publishEndTime.orDie
             }.catchAll {
               err =>
                 PublishResult(ErrorResult(err)) *>
                   notifyErrored *>
-                  busyState.update(_.setIdle) *>
+                  busyState.ref.update(s => ZIO.succeed(s.setIdle)) *>
                   publishEndTime.orDie
             }
         }
@@ -84,7 +81,7 @@ class LocalKernel private[kernel] (
 
       for {
         inner <- queueTask
-        _     <- publishStatus.publish1(CellStatusUpdate(id, Queued))
+        _     <- publishStatus.publish(CellStatusUpdate(id, Queued))
       } yield inner.onInterrupt(notifyCancelled)
   }
 
@@ -120,13 +117,46 @@ class LocalKernel private[kernel] (
     } yield signatures
   }.catchAll(_ => ZIO.succeed(None))
 
+  override def goToDefinition(source: Either[String, CellID], pos: Int): TaskC[List[DefinitionLocation]] =
+    CurrentNotebook.path.flatMap {
+      notebookPath =>
+        def asDepURL(lang: String)(location: DefinitionLocation): DefinitionLocation = location.uri match {
+          case uri if uri startsWith "#" => location
+          case uri => location.copy(uri = s"/dependency/$notebookPath?lang=$lang&dependency=$uri")
+        }
+
+
+        source match {
+          case Right(id) =>
+            val lookup = for {
+              (cell, interp, state) <- cellInterpreter(id, forceStart = true).onError(cause => Logging.error(cause))
+              locations             <- interp.goToDefinition(cell.content.toString, pos, state)
+            } yield locations.map(asDepURL(cell.language))
+            lookup.onError(Logging.error).catchAll(_ => ZIO.succeed(Nil))
+
+          case Left(uri) =>
+            val ext = uri.split('.').last
+            val lookup = for {
+              interps        <- interpreters.entries
+              (lang, interp) <- ZIO.succeed(interps.find(_._2.fileExtensions.contains(ext))).someOrFailException
+              locations      <- interp.goToDependencyDefinition(uri, pos)
+            } yield locations.map(asDepURL(lang))
+            lookup.onError(Logging.error).catchAll(_ => ZIO.succeed(Nil))
+        }
+    }
+
+  override def dependencySource(language: String, dependency: String): RIO[BaseEnv with GlobalEnv, String] = for {
+    interpreter <- interpreters.get(language).someOrFailException
+    source      <- interpreter.getDependencyContent(dependency)
+  } yield source
+
   override def init(): RIO[BaseEnv with GlobalEnv with CellEnv, Unit] = TaskManager.run("Predef", "Predef") {
     for {
       publishStatus <- PublishStatus.access
-      busyUpdater   <- busyState.discrete.terminateAfter(!_.alive).through(publishStatus.publish).compile.drain.forkDaemon
-      initialState  <- initScala().onError(err => (PublishResult(ErrorResult(err.squash)) *> busyState.update(_.setIdle)).orDie)
+      busyUpdater   <- busyState.changes.haltWhen(closed.await.run).foreachWhile(s => publishStatus.publish(s).as(s.alive)).forkDaemon
+      initialState  <- initScala().onError(err => (PublishResult(ErrorResult(err.squash)) *> busyState.ref.update(s => ZIO.succeed(s.setIdle))).orDie)
       _             <- ZIO.foreach_(initialState.values)(PublishResult.apply)
-      _             <- busyState.update(_.setIdle)
+      _             <- busyState.ref.update(s => ZIO.succeed(s.setIdle))
     } yield ()
   }
 
@@ -165,14 +195,14 @@ class LocalKernel private[kernel] (
   } yield predefState
 
   override def shutdown(): Task[Unit] = for {
-    _            <- busyState.update(_.setBusy)
+    _            <- busyState.ref.update(s => ZIO.succeed(s.setBusy))
     interpreters <- interpreters.values
     _            <- ZIO.foreachPar_(interpreters)(_.shutdown())
-    _            <- busyState.set(KernelBusyState(busy = false, alive = false))
+    _            <- busyState.ref.set(KernelBusyState(busy = false, alive = false))
     _            <- closed.succeed(())
   } yield ()
 
-  override def status(): Task[KernelBusyState] = busyState.get
+  override def status(): Task[KernelBusyState] = busyState.ref.get
 
   override def values(): Task[List[ResultValue]] = interpreterState.getState.map(_.scope)
 
@@ -195,7 +225,7 @@ class LocalKernel private[kernel] (
     } yield (cell, interpreter, State.id(id, prevState))
   }.provideSomeLayer[BaseEnv with GlobalEnv with CellEnv](CurrentTask.none).map {
     result => Option(result)
-  }.catchAll(_ => ZIO.succeed(None)).someOrFailException  // TODO: need a real OptionT
+  }.catchAll(err => Logging.error(err).as(None)).someOrFailException  // TODO: need a real OptionT
 
   private def getOrLaunch(language: String, at: CellID): RIO[BaseEnv with GlobalEnv with InterpreterEnv with CurrentNotebook with TaskManager, Interpreter] =
     interpreters.getOrCreate(language) {
@@ -242,8 +272,9 @@ class LocalKernel private[kernel] (
         }.toMap
 
         def updateValue(value: ResultValue): RIO[Blocking with Logging, ResultValue] = {
-          val makeStringRepr: UIO[StringRepr] =
-            ZIO(StringRepr(TinyString.truncatePretty(Option(value.value).flatMap(v => Option(v.toString)).getOrElse("null"))))
+          val makeStringRepr: RIO[Logging, StringRepr] =
+            ZIO(StringRepr(ShortString.truncatePretty(Option(value.value).flatMap(v => Option(v.toString)).getOrElse("null"))))
+              .onError(err => Logging.error("Error creating String repr", err))
               .catchAll {
                 err => ZIO.succeed(StringRepr(s"Error while representing ${value.name} as a String: ${err.getClass.getName}. Try executing ${value.name}.toString() to see the stack trace."))
               }
@@ -298,14 +329,14 @@ class LocalKernel private[kernel] (
 class LocalKernelFactory extends Kernel.Factory.LocalService {
 
   def apply(): RIO[BaseEnv with GlobalEnv with CellEnv, Kernel] = for {
-    scalaDeps    <- CoursierFetcher.fetch("scala")
-    (main, transitive) = scalaDeps.partition(_._1)
-    compiler     <- ScalaCompiler(main.map(_._3), transitive.map(_._3), Nil)
-    busyState    <- SignallingRef[Task, KernelBusyState](KernelBusyState(busy = true, alive = true))
-    interpreters <- RefMap.empty[String, Interpreter]
-    _            <- interpreters.getOrCreate("scala")(ScalaInterpreter().provideSomeLayer[Blocking](ZLayer.succeed(compiler)))
-    interpState  <- InterpreterState.access
-    closed       <- Promise.make[Throwable, Unit]
+    scalaDeps         <- CoursierFetcher.fetch("scala")
+    compiler          <- ScalaCompiler(scalaDeps, Nil)
+    busyState         <- SubscriptionRef.make(KernelBusyState(busy = true, alive = true))
+    interpreters      <- RefMap.empty[String, Interpreter]
+    mkScala            = ScalaInterpreter().provideSomeLayer[BaseEnv with Config with TaskManager](ZLayer.succeed(compiler))
+    _                 <- interpreters.getOrCreate("scala")(mkScala)
+    interpState       <- InterpreterState.access
+    closed            <- Promise.make[Throwable, Unit]
   } yield new LocalKernel(compiler, interpState, interpreters, busyState, closed)
 
 }

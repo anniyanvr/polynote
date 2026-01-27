@@ -3,7 +3,7 @@ package polynote.kernel
 import polynote.buildinfo.BuildInfo
 import polynote.kernel.environment.CurrentNotebook
 import polynote.kernel.task.TaskManager
-import polynote.messages.{ByteVector32, CellID, HandleType}
+import polynote.messages.{ByteVector32, CellID, HandleType, DefinitionLocation}
 import polynote.runtime.{StreamingDataRepr, TableOp}
 import zio.{Has, RIO, Task, URIO, ZIO}
 
@@ -28,6 +28,16 @@ trait Kernel {
     * Provide parameter hints for the given position in the given cell
     */
   def parametersAt(id: CellID, pos: Int): TaskC[Option[Signatures]]
+
+  /**
+    * Provide a location for the definition of whatever is at the given position in the given cell
+    */
+  def goToDefinition(fileOrCell: Either[String, CellID], pos: Int): TaskC[List[DefinitionLocation]]
+
+  /**
+    * Retrieve the source of the given dependency identifier from the given language
+    */
+  def dependencySource(language: String, dependency: String): RIO[BaseEnv with GlobalEnv, String]
 
   /**
     * Perform any initialization for the kernel

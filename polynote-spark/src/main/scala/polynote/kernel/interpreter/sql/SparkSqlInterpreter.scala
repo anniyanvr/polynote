@@ -1,14 +1,15 @@
 package polynote.kernel.interpreter.sql
 
 import org.apache.spark.sql.catalyst.parser.SqlBaseParser.SingleStatementContext
-import org.apache.spark.sql.catalyst.parser.{SqlBaseBaseVisitor, SqlBaseParser}
+import org.apache.spark.sql.catalyst.parser.{SqlBaseParserBaseVisitor, SqlBaseParser}
 import org.apache.spark.sql.thief.SessionStateThief
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import polynote.kernel.environment.CurrentNotebook
 import polynote.kernel.{BaseEnv, Completion, CompletionType, GlobalEnv, InterpreterEnv, ResultValue, ScalaCompiler, Signatures}
 import polynote.kernel.interpreter.{Interpreter, State}
+import polynote.kernel.logging.Logging
 import polynote.kernel.task.TaskManager
-import polynote.messages.{ShortString, TinyList}
+import polynote.messages.{DefinitionLocation, ShortString, TinyList}
 import polynote.runtime.spark.reprs.SparkReprsOf
 import zio.{RIO, Task, ZIO}
 import zio.blocking.{Blocking, effectBlocking}
@@ -61,6 +62,12 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
 
   def parametersAt(code: String, pos: Int, state: State): Task[Option[Signatures]] = ZIO.succeed(None)
 
+  override def goToDefinition(code: String, pos: RunId, state: State): RIO[Blocking, List[DefinitionLocation]] = ZIO.succeed(Nil)
+
+  override def goToDependencyDefinition(uri: String, pos: RunId): RIO[Blocking with Logging, List[DefinitionLocation]] = ZIO.succeed(Nil)
+
+  override def getDependencyContent(uri: String): RIO[Blocking, String] = ZIO.succeed("")
+
   private def loadFunctions: RIO[Blocking, Unit] =
     effectBlocking(sessionCatalog.listFunctions(sessionCatalog.getCurrentDatabase)).map {
       fns => functions ++= fns.map(_._1.funcName)
@@ -79,11 +86,13 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
       }
   }
 
+  override def fileExtensions: Set[String] = Set("sql")
+
   def init(state: State): RIO[InterpreterEnv, State] = loadCatalog.forkDaemon.as(state)
 
   def shutdown(): Task[Unit] = ZIO.unit
 
-  private class CompletionVisitor(pos: Int, availableSymbols: mutable.TreeSet[String]) extends SqlBaseBaseVisitor[List[Completion]] {
+  private class CompletionVisitor(pos: Int, availableSymbols: mutable.TreeSet[String]) extends SqlBaseParserBaseVisitor[List[Completion]] {
     override def defaultResult(): List[Completion] = Nil
 
     override def aggregateResult(aggregate: List[Completion], nextResult: List[Completion]): List[Completion] = aggregate ++ nextResult

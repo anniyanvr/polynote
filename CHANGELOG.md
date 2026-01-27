@@ -1,4 +1,264 @@
-# Unreleased
+# 0.7.2 (TBD)
+
+**Improvements:**
+- Restrict dependency caching to HTTP/HTTPS URLs only #1485
+  - The cache option now only applies to HTTP/HTTPS URLs and pip dependencies
+  - Other URL schemes (s3://, file://, etc.) no longer support the cache toggle
+  - The advanced cache options UI is now only shown for dependencies that support caching
+  - Updated documentation to reflect the caching behavior changes
+
+# 0.7.1 (TBD)
+This release adds support for Apache Spark 3.5 alongside Spark 3.3, upgrades to Java 17 runtime, and includes Python 3.10 compatibility fixes.
+
+**Breaking Changes:**
+- Spark 3.2.x and earlier versions are no longer supported
+  - Polynote now only supports Spark 3.3.4 and Spark 3.5.7
+
+**Features:**
+- Spark 3.5 Support #1479
+  - Add Spark 3.5.7 support alongside existing Spark 3.3.4 support
+  - Users can now choose between Spark 3.3 and Spark 3.5 by setting `spark_version` in notebook configuration
+  - Automatic runtime selection based on configuration
+  - Both Scala 2.12 and 2.13 supported with each Spark version
+
+**Improvements:**
+- Upgrade to Apache Spark 3.3.4 #1478
+  - Updated from Spark 3.1.2/3.2.1 to 3.3.4
+  - Both Scala versions now use the same Spark version
+  - Updated to Hadoop 3.x binaries for improved cloud storage support
+- Use JDK 17 runtime #1471
+  - Upgraded from Java 8 to Java 17 for CI builds and runtime
+  - Added JVM compatibility flags for Spark to work with Java 17+
+  - Better performance and security with modern Java runtime
+- Bump Scala versions #1472
+  - Updated Scala 2.12.15 → 2.12.20
+  - Updated Scala 2.13.6 → 2.13.11
+- Update dependencies
+  - Update Jep and Pandas
+  - Update plugin config to use new structure
+- CI/Build improvements
+  - Extract test script for better maintainability #1476
+  - Bump OS version #1469
+  - Use `sbt ++` for consistent Scala version across all projects
+  - Add 30-minute timeout to prevent jobs from hanging
+
+**Bugfixes:**
+- Fix sbt warnings for unused circe version keys #1484
+- Fix build timeout by downloading Spark packages from GitHub instead of Apache archive #1483
+- Fix spark download deadlock in test setup #1475
+  - Improved lock file mechanism with robust cleanup
+  - Stale lock detection and automatic recovery
+  - Version-specific lock files to allow parallel builds
+- Fix polynote.py for Python 3.10 compatibility
+- Add vscode / metals to gitignore #1480
+- Shade Google dependencies in assembly #1477
+- Shade shapeless dependency to avoid version conflicts
+- Compiler gets boot classpath first without dep isolation
+- Remove circe from plugin API boundary
+- Add more python-ish stub methods to KernelRuntime.Output
+- Add PluginConfig
+
+# 0.6.1 (Jan 10, 2025)
+**Breaking Changes:**
+- Drop Scala 2.11 support #1443
+  - Polynote now only supports Scala 2.12 and 2.13
+
+**Improvements:**
+- Update to latest SBT to run in modern JDK #1443
+- Update Circe dependency #1448
+- Update DEVELOPING.md documentation #1446
+- Add -release option for Java compiler targeting Java 8 #1452
+
+**Bugfixes:**
+- Fix CI sbt missing issue #1460
+- Fix startup script to exclude sys.pycache_prefix from search for jep #1455 (thanks @JanukanS)
+- Add dependency override for shapeless to avoid version conflicts #1453
+- Fix comment cancellation functionality #1444 (thanks @paaatrrrick)
+  - Cancelling a reply now properly removes its text
+- Update merge strategy to handle JDK9+ modules
+- Fix startup script for proper operation
+
+# 0.6.0 (Apr 23, 2024)
+**Features:**
+- Jump-to-definition support for Scala, Java, and Python #1372 #1408 #1418
+  - Navigate to symbol definitions across your codebase
+  - Improvements to jump-to-definition for Java and Python sources
+
+**Improvements:**
+- More robust Python library paths configuration #1433
+  - Defensively add more comprehensive set of paths to PYTHONPATH and LD_LIBRARY_PATH
+  - Print warnings when PYTHONPATH and LD_LIBRARY_PATH are not set
+- Scala version configuration moved to Spark config section #1432
+  - Better organization of Scala version selection in UI
+  - Update spark template config format
+- Pin Jep to version 4.1.1 #1429
+- Webpack watch improvements for stylesheets #1415
+  - Only build stylesheets if .less files are changed
+  - Execute build_style script when in watch mode
+- Fast fail build if tar download/extract fails #1425
+  - Use curl to download with checksum verification
+  - Better error handling during build process
+
+**Bugfixes:**
+- Fix for renaming notebooks #1423
+  - Resolves issues with notebook state after rename
+- Fix config UI not displaying templates outside of server templates #1437
+- Fix parsing failures with better error messages #1414
+  - Catch parsing failure and insert path to notebook in error message
+- Fix empty dependency array handling #1421
+- Fix copying repository configurations #1410
+  - Wrap repository configurations in object with repo type for correct JSON parsing
+- Fix Scala default version issues #1409
+  - Add observer to scala version handler when loading notebook config
+- Fix multiple comments on same range #1413
+  - Add undefined checks to fix comment deletion
+  - Improve comment state handling
+- Improve search modal error handling #1413 #1415
+  - Filter out non-relevant server errors in search modal
+  - Better error formatting and messaging
+- Update notebook help icon button URL #1440 (thanks @ikpaetukgabriel)
+
+# 0.5.2 (Nov 2022)
+**Features:**
+- Jump-to-definition MVP #1372
+
+**Improvements:**
+- Update to Scala 2.12.15 #1405
+- Allow StringRepr to be longer #1399
+- Split build into individual scala versions
+
+**Bugfixes:**
+- Fix Spark 2.4 BC SQLContext compatibility #1387 (thanks @skilld-labs)
+  - Use SQLContext._get_or_create instead of deprecated _wrapped
+- Fix typo in basic-usage.md #1395 (thanks @wsargent)
+- Stop publishing scaladoc #1401
+
+# 0.5.1 (Mar 28, 2022)
+**Features:**
+- Add log verbosity configuration #1380 (thanks @dhia-gharsallaoui)
+
+**Bugfixes:**
+- Fix an issue preventing the creation of zombie kernels by adding a KeepAlive between kernel <-> server #1319
+- Add support for .txt dependencies in Python #1357 
+- Add stylesheet versions to bust the CSS cache on new version deployments #1136 
+- Fix an issue where panels can be dragged to a negative width and then couldn't be adjusted again #1335 
+- Add an error message on config paste failure #1375
+- Fix a bug where execution info was copied when a new cell was inserted without being explicitly requested #1392
+
+**Misc:**
+- Upgrade Monaco version, adding support for various new Monaco features and fixing some longstanding editor bugs #457 #1382 
+- Upgrade Webpack version to fix CI failures #1388 
+
+# 0.5.0 (Nov 30, 2022) 
+**Features:**
+- Add a table of contents along with a full left navbar redesign #1301 
+  - The new table of contents can be accessed under the `Summary` button in the new left navbar
+  - Headings will automatically be added as you write h1-h6 headings in text cells. Click on a code cell to see where it is 
+  relevant to the closest heading, or click on a heading in the left pane to jump straight to that text cell. 
+  - For full documentation on the new left navbar redesign, [see the docs here. ](https://polynote.org/latest/docs/left-pane/)
+- Display each kernel's time since last run and since last save in settings pane #812 
+
+**Bugfixes:**
+- Fix a few issues where focusing raw markdown cells didn't always render the old markdown cell you left #1315 
+- Use a workaround to fix occasional compilation issues with shadowjars #1352 
+
+**Misc:**
+- Pin Jep back to its default version #1360 
+- Bump to sbt 1.7.2. and fix slash syntax (thanks @MasseGuillaume) #1350 
+- Mention that Scala 2.13 is in alpha support in docs (thanks @pan3793) #1368
+
+# 0.4.10 (Nov 7, 2022)
+**Features:**
+* Added a new design for the notebook list! #1118 
+  * You can now sort notebooks by recently edited timestamp or by name in ascending or descending order. [See docs here. ](https://polynote.org/latest/docs/notebooks-list/) 
+* Support `.txt` dependency lists for JARs #1349 
+  * You can now use `.txt` files as dependencies, where each JAR is listed on a newline. [See docs here. ](https://polynote.org/latest/docs/notebook-configuration/#jvm-dependencies) 
+
+**Bugfixes:**
+* Use relaxed dependency resolution #1300 
+* Remove extra dropdown button on advanced options label #1358 
+
+# 0.4.9 (Oct 18, 2022) 
+**Features:** 
+* Add branch-level granularity for notebook drag n' drop #1298 
+* Add in-app notifications for new updates 
+* Add run selected cell hotkey + VSCode hotkey link #1313 
+* Add more documentation around the PythonObject API #1320 
+
+**Bugfixes:** 
+* Fix a bug where new comments could not be created 
+* Fix an issue with the size of the search modal sometimes not conforming with the result table #1337 
+* Fix error cards in the task pane appearing clickable on hover when they shouldn't be #1316 
+* Fix the Copy & Paste configuration buttons to more accurately reflect the saved kernel state #1314 
+* Add a note to the documentation about using the `?nocache` query string. 
+
+# 0.4.8 (Sep 15, 2022) 
+**Bugfixes:**
+* Fixes a bug where there was no max width set on the search modal 
+* Fixes a bug where the kernel pane would not update on notebook switch 
+* Fixes the link on the Configuration & Dependencies `Learn More` icon  
+
+# 0.4.7 (Sep 15, 2022) 
+**Features:**
+* Added support for searching across all your notebooks! #983 
+  * You can use the new search icon next to the plus in your notebooks list to search across all of your notebooks for a line of text/code 
+* Clicking on a running task card in your `Tasks` pane will now jump you to the corresponding cell #1274 
+* Added help icons throughout various places of the UI #1305 
+  * These will take you directly to the documentation to explain the section of the UI they represent 
+* Added support for copying and pasting notebook configurations between notebooks 
+  * See [here](https://polynote.org/latest/docs/notebook-configuration/#copying-configurations) for documentation 
+* Added dropdowns for each sub-section in the `Configuration & Dependencies` section for easier navigability #1277 
+* Each error in your `Tasks` pane has a copy button that will copy the error message + stack trace for easy sharability #1294 
+  * The stack trace has also been made easier to read. 
+
+**Bugfixes:**
+* Fixed a bug where running tasks that got converted to errors couldn't be closed in the `Tasks` pane 
+* Added a UI label to explain how to use absolute file paths for JARs #1212 
+
+# 0.4.6 (Sep 2, 2022) 
+**Features:** 
+* Notebook templates for creating new notebooks #1190 
+* Allow raw markdown editing in place of RTE #755
+  * There is a preference to toggle between these two text editing modes in your settings 
+* Add a cell button to wrap output text #1038 
+* Add a cell button to split two cells side-by-side in the UI #1023 
+* Add a button to run this cell and all the cells below #1283 
+* Various documentation updates ([new about menu page](https://polynote.org/latest/docs/about-menu/), 
+[templates](https://polynote.org/latest/docs/server-configuration/#templates), 
+[markdown cells](https://polynote.org/latest/docs/text-cells/#markdown-editing), 
+[setting up Polynote's development environment](https://github.com/polynote/polynote/blob/master/DEVELOPING.md), 
+[local Spark setup](https://polynote.org/latest/docs/installation/#spark-support), and more! 
+
+**Bugfixes:** 
+* Fix MRO issue with Python cells having a problem interfacing with Scala collections #1249 
+  * This fix should greatly improve the polyglot experience between Python and Scala! 
+* Fix formatting of intersection types
+* Make it a bit more obvious on how to add a new cell through the UI #1262 
+* Increase the number of dependencies a notebook can have (from 255 to 32767!) #1275 
+  * To handle these larger dependency counts, we've capped the number of concurrent downloads to 16. 
+* Fix `Shift+Enter` not creating the next cell to jump to if none exists #1270 
+* Change 'Open Kernel' to 'Open Notebooks' and add a description of what the pane does #1280  
+
+# 0.4.5 (Feb 15, 2022)
+* Fix bug preventing addition of new cells in empty notebooks #1229
+* Fix a failure in the notebook runner when the notebook has a 'viz' cell #1236
+
+# 0.4.4 (Dec 10, 2021)
+* Upgrade Jep to 4.0.0
+* Fix for a bug handling JVM arguments in Spark kernels #1221
+* Fix a bug displaying the Cause of exceptions #1226
+
+# 0.4.3 (Nov 24, 2021)
+* Preliminary alpha support for Scala 2.13 (with Spark 3) (not yet ready for release)
+* Fix an issue which sometimes caused Polynote to reject all updates, "freezing" the notebook in an old state.
+* Safety and performance improvements to `ReprsOf` solving OOMs when handling huge collections.
+* Fix some concurrent editing bugs. 
+* Support for output of stderr to the UI (only really for Python right now)
+* Fix a crash when insanely long lines are printed to console.
+* Improve Python performance (in some cases running in Polynote was ~10x slower than the REPL) 
+* Implement `isatty()` to work around some issues where Python libraries check for this.. 
+* Some Dockerfile improvements and documentation fixes (Thanks @holdenk !) 
+* Fixed a docs typo! (Thanks @kuckjwi0928 !) 
 
 # 0.4.2 (June 25, 2021)
 * PySpark dependencies now configurable. #1175

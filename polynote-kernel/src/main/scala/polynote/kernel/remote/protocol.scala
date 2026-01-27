@@ -36,10 +36,6 @@ object IdentifyChannel {
   def encode(value: IdentifyChannel): Task[BitVector] = ZIO.fromEither(codec.encode(value).toEither).mapError(err => new RuntimeException(err.message))
 }
 
-object Update {
-  implicit val notebookUpdateCodec: Codec[NotebookUpdate] = NotebookUpdate.codec
-}
-
 sealed trait RemoteRequest {
   val reqId: Int
 }
@@ -103,6 +99,16 @@ object CancelRequest extends RemoteRequestCompanion[CancelRequest](12)
 
 final case class KernelInfoRequest(reqId: Int) extends RemoteRequest
 object KernelInfoRequest extends RemoteRequestCompanion[KernelInfoRequest](13)
+
+final case class KeepAliveRequest(reqId: Int) extends RemoteRequest
+object KeepAliveRequest extends RemoteRequestCompanion[KeepAliveRequest](15)
+
+final case class RemoteGoToDefinitionRequest(reqId: Int, id: Either[String, CellID], pos: Int) extends RemoteRequest
+object RemoteGoToDefinitionRequest extends RemoteRequestCompanion[RemoteGoToDefinitionRequest](16)
+
+final case class RemoteDependencySourceRequest(reqId: Int, language: String, dependency: String) extends RemoteRequest
+object RemoteDependencySourceRequest extends RemoteRequestCompanion[RemoteDependencySourceRequest](17)
+
 
 object RemoteRequest {
   implicit val discriminated: Discriminated[RemoteRequest, Byte] = Discriminated(byte)
@@ -175,6 +181,12 @@ object ErrorResponse extends RemoteResponseCompanion[ErrorResponse](14) {
     e => (e.reqId -> e.err)
   )
 }
+
+final case class RemoteGoToDefinitionResponse(reqId: Int, locations: List[DefinitionLocation]) extends RemoteRequestResponse
+object RemoteGoToDefinitionResponse extends RemoteResponseCompanion[RemoteGoToDefinitionResponse](16)
+
+final case class RemoteDependencySourceResponse(reqId: Int, source: String) extends RemoteRequestResponse
+object RemoteDependencySourceResponse extends RemoteResponseCompanion[RemoteDependencySourceResponse](17)
 
 object RemoteResponse {
   implicit val discriminated: Discriminated[RemoteResponse, Byte] = Discriminated(byte)

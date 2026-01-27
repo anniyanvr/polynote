@@ -1,13 +1,10 @@
 package polynote.kernel.util
 
-import java.util.concurrent.ConcurrentHashMap
+import zio.stm.TReentrantLock
+import zio.{Promise, RIO, Ref, UIO, ZIO}
 
+import java.util.concurrent.ConcurrentHashMap
 import scala.collection.JavaConverters._
-import cats.syntax.traverse._
-import cats.instances.list._
-import zio.interop.catz._
-import zio.stm.{TReentrantLock, ZSTM}
-import zio.{Promise, RIO, Ref, Semaphore, Task, UIO, ZIO}
 
 
 /**
@@ -77,6 +74,10 @@ class RefMap[K, V] private (
 
   def values: UIO[List[V]] = ZIO.collectAll(underlying.values().asScala.toList.collect {
     case Right(ref) => ref.get
+  })
+
+  def entries: UIO[List[(K, V)]] = ZIO.collectAll(underlying.asScala.toList.collect {
+    case (key, Right(ref)) => ref.get.map(value => (key, value))
   })
 
   def isEmpty: UIO[Boolean] = ZIO.effectTotal(underlying.isEmpty)

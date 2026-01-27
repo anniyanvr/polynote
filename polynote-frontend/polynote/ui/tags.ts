@@ -314,6 +314,13 @@ export function iconButton(classes: string[], title: string, iconName: string, a
     return button(classes, {title: title}, icon([], iconName, alt));
 }
 
+export function helpIconButton(classes: string[], url: string): TagElement<"button"> {
+    classes.push('help-icon');
+    const b = iconButton(classes, "Learn More","circle-help", "Learn More");
+    b.click(() => window.open(url));
+    return b;
+}
+
 export interface InputType {
     text: string
     number: number
@@ -383,6 +390,7 @@ export interface DropdownElement extends TagElement<"select"> {
     getSelectedValue(): string
     addValue(key: string, val: string): void
     onSelect(fn: (newValue: string) => void): TagElement<"select">
+    clearValues(): void
 }
 
 export function dropdown(classes: string[], options: Record<string, string>, value?: string): DropdownElement & BindableTagElement<string, 'select', DropdownElement> {
@@ -412,6 +420,10 @@ export function dropdown(classes: string[], options: Record<string, string>, val
         },
         onSelect(fn: (newValue: string) => void): TagElement<"select"> {
             return select.change(_ => fn(this.getSelectedValue()));
+        },
+        clearValues(): void {
+            select.innerHTML = "";
+            opts = [];
         }
     });
 
@@ -460,9 +472,9 @@ export function h4(classes: string[], content: Content) {
     return tag('h4', classes, {}, content);
 }
 
-export function label(classes: string[], label: string, input: TagElement<"input" | "select" | "textarea">): TagElement<"label"> {
+export function label(classes: string[], label: string, input: TagElement<"input" | "select" | "textarea">, largeLabel: boolean = false): TagElement<"label"> {
     return tag('label', classes, {}, [
-       span(['label-title'], label),
+       largeLabel ? h4(['label-title'], label) : span(['label-title'], label),
        input
     ]);
 }
@@ -495,6 +507,7 @@ export interface TableElement extends TagElement<"table"> {
     findRows(props: Record<string, string>, tbody?: TagElement<"tbody">): TableRowElement[]
     findRowsBy(fn: (row: TableRow) => boolean, tbody?: TagElement<"tbody">): TableRowElement[]
     addBody(rows?: TableRow[]): TagElement<"tbody">
+    clear(whichBody? : TagElement<"tbody">): TagElement<"tbody">
 }
 
 /**
@@ -597,6 +610,17 @@ export function table(classes: string[], contentSpec: TableContentSpec): TableEl
                 rows.forEach(row => table.addRow(row, newBody));
             }
             return newBody;
+        },
+        clear(whichBody? : TagElement<"tbody">) {
+            if (whichBody) { // clear rows in this tbody element
+                whichBody.innerHTML = "";
+            }
+            else { // do a clean reset of the table
+                body.innerHTML = "";
+                table.innerHTML = "";
+                table.appendChild(body);
+            }
+            return whichBody ?? body; // return the cleared element
         }
     });
 }
